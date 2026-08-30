@@ -4,6 +4,7 @@ import {
   Platform,
   StatusBar as RNStatusBar,
   StyleSheet,
+  Text,
   TextInput,
   View,
 } from 'react-native';
@@ -14,6 +15,7 @@ export default function App() {
   return (
     <View style={styles.container}>
       <View style={styles.searchBar}>
+        <Text style={styles.greeting}>hello, Zeus!!</Text>
         <TextInput
           style={styles.input}
           value={address}
@@ -43,6 +45,12 @@ const styles = StyleSheet.create({
     paddingTop: TOP_INSET,
     paddingHorizontal: 16,
     paddingBottom: 12,
+  },
+  greeting: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#000',
+    marginBottom: 12,
   },
   input: {
     height: 44,
