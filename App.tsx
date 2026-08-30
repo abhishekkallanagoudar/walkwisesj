@@ -6,7 +6,6 @@ import {
   Alert,
   FlatList,
   Keyboard,
-  Linking,
   Platform,
   Pressable,
   StatusBar as RNStatusBar,
@@ -15,12 +14,21 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import MapView, { Marker, Polyline } from 'react-native-maps';
+
+type LatLng = { latitude: number; longitude: number };
 
 type Suggestion = {
   id: string;
   label: string;
   latitude: number;
   longitude: number;
+};
+
+type Route = {
+  points: LatLng[];
+  meters: number;
+  seconds: number;
 };
 
 // Photon is a free, no-key geocoder built on OpenStreetMap data.
@@ -62,13 +70,47 @@ async function queryPhoton(
   }));
 }
 
+// FOSSGIS runs a free, no-key OSRM server with a pedestrian profile.
+const OSRM_FOOT_URL = 'https://routing.openstreetmap.de/routed-foot/route/v1/foot';
+
+async function fetchWalkingRoute(from: LatLng, to: LatLng): Promise<Route | null> {
+  const coordPair =
+    `${from.longitude},${from.latitude};${to.longitude},${to.latitude}`;
+  const res = await fetch(
+    `${OSRM_FOOT_URL}/${coordPair}?overview=full&geometries=geojson`,
+  );
+  const json = await res.json();
+  const r = json.routes?.[0];
+  if (!r) return null;
+  return {
+    points: r.geometry.coordinates.map(([lon, lat]: [number, number]) => ({
+      latitude: lat,
+      longitude: lon,
+    })),
+    meters: r.distance,
+    seconds: r.duration,
+  };
+}
+
+function formatDistance(m: number): string {
+  return m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(1)} km`;
+}
+
+function formatDuration(s: number): string {
+  const min = Math.max(1, Math.round(s / 60));
+  if (min < 60) return `${min} min`;
+  return `${Math.floor(min / 60)} h ${min % 60} min`;
+}
+
 export default function App() {
   const [address, setAddress] = useState('');
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<Suggestion | null>(null);
+  const [route, setRoute] = useState<Route | null>(null);
   // Device location, used to bias results toward what's nearby.
   const coords = useRef<{ lat: number; lon: number } | null>(null);
+  const mapRef = useRef<MapView>(null);
   // Skip the lookup that would otherwise fire right after we set the text ourselves.
   const skipNextLookup = useRef(false);
 
@@ -130,46 +172,58 @@ export default function App() {
     setSuggestions([]);
   }
 
-  function openWalkingDirections(dest: Suggestion) {
-    const params = new URLSearchParams({
-      api: '1',
-      destination: `${dest.latitude},${dest.longitude}`,
-      travelmode: 'walking',
-    });
-    if (coords.current) {
-      params.set('origin', `${coords.current.lat},${coords.current.lon}`);
+  // Fit the map to the whole route whenever a new one loads.
+  useEffect(() => {
+    if (route && mapRef.current) {
+      mapRef.current.fitToCoordinates(route.points, {
+        edgePadding: { top: 40, right: 40, bottom: 40, left: 40 },
+        animated: true,
+      });
     }
-    Linking.openURL(
-      `https://www.google.com/maps/dir/?${params.toString()}`,
-    ).catch(() => Alert.alert('Could not open a maps app for directions.'));
-  }
+  }, [route]);
 
-  // "Go": resolve the address if needed, then open walking directions to it.
+  // "Go": resolve the address if needed, then show the walking route to it.
   async function handleGo() {
     Keyboard.dismiss();
     const query = address.trim();
     if (!query) return;
 
+    if (!coords.current) {
+      Alert.alert('Enable location access to get walking directions.');
+      return;
+    }
+
     let dest = selected;
-    if (!dest) {
-      setLoading(true);
-      try {
+    setLoading(true);
+    try {
+      if (!dest) {
         const results = await queryPhoton(query, coords.current);
         dest = results[0] ?? null;
         if (dest) handleSelect(dest);
-      } catch {
-        dest = null;
-      } finally {
-        setLoading(false);
       }
+      if (!dest) {
+        Alert.alert('No matching address found.');
+        return;
+      }
+      setSuggestions([]);
+      const origin = {
+        latitude: coords.current.lat,
+        longitude: coords.current.lon,
+      };
+      const walking = await fetchWalkingRoute(origin, {
+        latitude: dest.latitude,
+        longitude: dest.longitude,
+      });
+      if (!walking) {
+        Alert.alert('Could not find a walking route to that address.');
+        return;
+      }
+      setRoute(walking);
+    } catch {
+      Alert.alert('Something went wrong loading directions.');
+    } finally {
+      setLoading(false);
     }
-
-    if (!dest) {
-      Alert.alert('No matching address found.');
-      return;
-    }
-    setSuggestions([]);
-    openWalkingDirections(dest);
   }
 
   return (
@@ -182,6 +236,7 @@ export default function App() {
             value={address}
             onChangeText={(text) => {
               setSelected(null);
+              setRoute(null);
               setAddress(text);
             }}
             placeholder="enter address here"
@@ -224,10 +279,43 @@ export default function App() {
           </View>
         )}
 
-        {selected && (
+        {selected && !route && (
           <Text style={styles.coords}>
             {selected.latitude.toFixed(5)}, {selected.longitude.toFixed(5)}
           </Text>
+        )}
+
+        {route && (
+          <View style={styles.mapCard}>
+            <MapView
+              ref={mapRef}
+              style={styles.map}
+              initialRegion={{
+                latitude: route.points[0].latitude,
+                longitude: route.points[0].longitude,
+                latitudeDelta: 0.05,
+                longitudeDelta: 0.05,
+              }}
+            >
+              <Marker
+                coordinate={route.points[0]}
+                title="Start"
+                pinColor="#34C759"
+              />
+              <Marker
+                coordinate={route.points[route.points.length - 1]}
+                title={selected?.label ?? 'Destination'}
+              />
+              <Polyline
+                coordinates={route.points}
+                strokeColor="#007AFF"
+                strokeWidth={4}
+              />
+            </MapView>
+            <Text style={styles.routeMeta}>
+              {formatDistance(route.meters)} · {formatDuration(route.seconds)} walk
+            </Text>
+          </View>
         )}
       </View>
       <StatusBar style="auto" />
@@ -244,7 +332,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
   },
   searchBar: {
-    paddingTop: TOP_INSET,
+    paddingTop: TOP_INSET + 48,
     paddingHorizontal: 16,
     paddingBottom: 12,
   },
@@ -312,5 +400,23 @@ const styles = StyleSheet.create({
     marginTop: 8,
     fontSize: 13,
     color: '#8E8E93',
+  },
+  mapCard: {
+    marginTop: 12,
+    borderRadius: 12,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#D1D1D6',
+  },
+  map: {
+    width: '100%',
+    height: 260,
+  },
+  routeMeta: {
+    padding: 10,
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#000',
+    backgroundColor: '#fff',
   },
 });
