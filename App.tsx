@@ -1,6 +1,6 @@
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -47,14 +47,19 @@ type Crash = {
   fatal: boolean;
 };
 
-type SafetyStats = {
+type SafetyLevel = 'low' | 'medium' | 'high';
+
+// A route plus its safety assessment against the San José datasets.
+type ScoredRoute = Route & {
+  crashes: Crash[];
   corridorMeters: number;
-  ratio: number;
+  corridorRatio: number;
   crashCount: number;
   fatalCount: number;
   crashesPerKm: number;
-  level: 'low' | 'medium' | 'high';
-  outOfArea: boolean;
+  level: SafetyLevel;
+  riskScore: number; // lower = safer
+  rank: number; // 0 = safest of the alternatives
 };
 
 // Photon is a free, no-key geocoder built on OpenStreetMap data.
@@ -102,20 +107,21 @@ const OSRM_BASE: Record<TravelMode, string> = {
   bike: 'https://routing.openstreetmap.de/routed-bike/route/v1/bike',
 };
 
-async function fetchRoute(
+// Ask OSRM for up to three distinct routes so we can rank them for safety.
+async function fetchRoutes(
   from: LatLng,
   to: LatLng,
   mode: TravelMode,
-): Promise<Route | null> {
+): Promise<Route[]> {
   const coordPair =
     `${from.longitude},${from.latitude};${to.longitude},${to.latitude}`;
   const res = await fetch(
-    `${OSRM_BASE[mode]}/${coordPair}?overview=full&geometries=geojson`,
+    `${OSRM_BASE[mode]}/${coordPair}?alternatives=3&overview=full&geometries=geojson`,
   );
   const json = await res.json();
-  const r = json.routes?.[0];
-  if (!r) return null;
-  return {
+  const rs = json.routes;
+  if (!Array.isArray(rs) || rs.length === 0) return [];
+  return rs.map((r: any) => ({
     points: r.geometry.coordinates.map(([lon, lat]: [number, number]) => ({
       latitude: lat,
       longitude: lon,
@@ -123,7 +129,7 @@ async function fetchRoute(
     meters: r.distance,
     seconds: r.duration,
     mode,
-  };
+  }));
 }
 
 function formatDistance(m: number): string {
@@ -268,18 +274,23 @@ function crashesNearRoute(routePts: LatLng[], all: Crash[]): Crash[] {
   });
 }
 
-// How exposed the route is: time on priority safety corridors plus the number
-// of killed/severely-injured crashes (the High Injury Network) alongside it.
-function analyzeSafety(
-  routePts: LatLng[],
+// Rate one route: metres on priority safety corridors, plus the killed/severely
+// -injured crashes (the High Injury Network) alongside it. Lower riskScore = safer.
+function scoreRoute(
+  route: Route,
   corridors: Corridor[],
-  nearCrashes: Crash[],
-): SafetyStats {
+  allCrashes: Crash[],
+): ScoredRoute {
+  const box = bboxOf(route.points);
+  const nearCorridors = corridors.filter((c) =>
+    bboxIntersect(c.bbox, box, 0.003),
+  );
+
   let total = 0;
   let onCorridor = 0;
-  for (let i = 0; i < routePts.length - 1; i++) {
-    const a = routePts[i];
-    const b = routePts[i + 1];
+  for (let i = 0; i < route.points.length - 1; i++) {
+    const a = route.points[i];
+    const b = route.points[i + 1];
     const segLen = segMeters(a, b);
     total += segLen;
     const mid: LatLng = {
@@ -287,7 +298,7 @@ function analyzeSafety(
       longitude: (a.longitude + b.longitude) / 2,
     };
     let near = false;
-    for (const c of corridors) {
+    for (const c of nearCorridors) {
       if (near) break;
       for (let j = 0; j < c.points.length - 1; j++) {
         if (pointToSegMeters(mid, c.points[j], c.points[j + 1]) <= ON_CORRIDOR_M) {
@@ -298,29 +309,50 @@ function analyzeSafety(
     }
     if (near) onCorridor += segLen;
   }
-  const ratio = total > 0 ? onCorridor / total : 0;
+
+  const corridorRatio = total > 0 ? onCorridor / total : 0;
+  const crashes = crashesNearRoute(route.points, allCrashes);
   const km = total / 1000;
-  const crashCount = nearCrashes.length;
-  const fatalCount = nearCrashes.filter((c) => c.fatal).length;
+  const crashCount = crashes.length;
+  const fatalCount = crashes.filter((c) => c.fatal).length;
   const crashesPerKm = km > 0 ? crashCount / km : 0;
 
-  const high = ratio >= 0.25 || crashesPerKm >= 6 || fatalCount >= 1;
-  const medium = ratio >= 0.05 || crashesPerKm >= 2 || crashCount >= 1;
-  const level = high ? 'high' : medium ? 'medium' : 'low';
+  const high = corridorRatio >= 0.25 || crashesPerKm >= 6 || fatalCount >= 1;
+  const medium = corridorRatio >= 0.05 || crashesPerKm >= 2 || crashCount >= 1;
+  const level: SafetyLevel = high ? 'high' : medium ? 'medium' : 'low';
+
+  // Corridor exposure dominates the ranking (scaled way up); crashes and any
+  // fatality only decide between routes whose corridor use is nearly equal.
+  const riskScore =
+    corridorRatio * 10000 + crashesPerKm * 5 + fatalCount * 25;
 
   return {
+    ...route,
+    crashes,
     corridorMeters: onCorridor,
-    ratio,
+    corridorRatio,
     crashCount,
     fatalCount,
     crashesPerKm,
     level,
-    outOfArea: false,
+    riskScore,
+    rank: 0,
   };
 }
 
-function safetyColor(level: SafetyStats['level']): string {
-  return level === 'low' ? '#34C759' : level === 'medium' ? '#FF9500' : '#FF3B30';
+// Calm (green) -> moderate (amber) -> busy (soft coral, deliberately not a
+// harsh red so the app stays reassuring for everyday pedestrians).
+function safetyColor(level: SafetyLevel): string {
+  return level === 'low' ? '#34C759' : level === 'medium' ? '#FF9F0A' : '#FF7043';
+}
+
+// Translucent variant for the un-selected alternative routes.
+function altColor(level: SafetyLevel): string {
+  return level === 'low'
+    ? 'rgba(52,199,89,0.75)'
+    : level === 'medium'
+      ? 'rgba(255,159,10,0.75)'
+      : 'rgba(255,112,67,0.8)';
 }
 
 export default function App() {
@@ -328,16 +360,44 @@ export default function App() {
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<Suggestion | null>(null);
-  const [route, setRoute] = useState<Route | null>(null);
+  const [routes, setRoutes] = useState<Route[]>([]);
+  const [scored, setScored] = useState<ScoredRoute[]>([]);
+  const [activeIdx, setActiveIdx] = useState(0);
+  const [outOfArea, setOutOfArea] = useState(false);
   const [corridors, setCorridors] = useState<Corridor[]>([]);
-  const [nearbyCorridors, setNearbyCorridors] = useState<Corridor[]>([]);
-  const [nearCrashes, setNearCrashes] = useState<Crash[]>([]);
-  const [safety, setSafety] = useState<SafetyStats | null>(null);
   // Device location, used to bias results toward what's nearby.
   const coords = useRef<{ lat: number; lon: number } | null>(null);
   const mapRef = useRef<MapView>(null);
   // Skip the lookup that would otherwise fire right after we set the text ourselves.
   const skipNextLookup = useRef(false);
+
+  const active = scored[activeIdx] ?? null;
+
+  // Priority safety corridors near any of the shown routes, for the overlay.
+  const nearbyCorridors = useMemo(() => {
+    if (!scored.length) return [];
+    const box = scored.reduce<BBox>(
+      (acc, r) => {
+        const b = bboxOf(r.points);
+        return [
+          Math.min(acc[0], b[0]),
+          Math.min(acc[1], b[1]),
+          Math.max(acc[2], b[2]),
+          Math.max(acc[3], b[3]),
+        ];
+      },
+      [Infinity, Infinity, -Infinity, -Infinity],
+    );
+    return corridors.filter((c) => bboxIntersect(c.bbox, box, 0.003));
+  }, [scored, corridors]);
+
+  // Whether the alternatives differ enough in risk to bother labelling one "safest".
+  const routesDiffer = useMemo(() => {
+    if (scored.length < 2) return false;
+    const scores = scored.map((r) => r.riskScore);
+    // ~1.5 percentage points of corridor difference, or a big crash gap.
+    return Math.max(...scores) - Math.min(...scores) > 150;
+  }, [scored]);
 
   // Ask for location once on mount so nearby results can be prioritized.
   useEffect(() => {
@@ -404,62 +464,71 @@ export default function App() {
       .catch(() => setCorridors([]));
   }, []);
 
-  // Fit the map to the whole route whenever a new one loads.
+  // Fit the map to all alternatives whenever a new set loads.
   useEffect(() => {
-    if (route && mapRef.current) {
-      mapRef.current.fitToCoordinates(route.points, {
-        edgePadding: { top: 40, right: 40, bottom: 40, left: 40 },
-        animated: true,
-      });
+    if (scored.length && mapRef.current) {
+      mapRef.current.fitToCoordinates(
+        scored.flatMap((r) => r.points),
+        {
+          edgePadding: { top: 40, right: 40, bottom: 40, left: 40 },
+          animated: true,
+        },
+      );
     }
-  }, [route]);
+  }, [scored]);
 
-  // Score the current route against the safety corridors and the KSI crash
-  // history (the High Injury Network), which is fetched for the route's area.
+  // Score every alternative against the safety corridors and the KSI crash
+  // history (the High Injury Network), then pick the safest as active.
   useEffect(() => {
-    if (!route) {
-      setNearbyCorridors([]);
-      setNearCrashes([]);
-      setSafety(null);
+    if (!routes.length) {
+      setScored([]);
+      setActiveIdx(0);
+      setOutOfArea(false);
       return;
     }
 
-    const routeBox = bboxOf(route.points);
-    const nearby = corridors.filter((c) =>
-      bboxIntersect(c.bbox, routeBox, 0.003),
-    );
-    setNearbyCorridors(nearby);
-
     let cancelled = false;
     (async () => {
-      let near: Crash[] = [];
+      // One crash fetch covering the bounding box of all alternatives.
+      const allBox = routes.reduce<BBox>(
+        (acc, r) => {
+          const b = bboxOf(r.points);
+          return [
+            Math.min(acc[0], b[0]),
+            Math.min(acc[1], b[1]),
+            Math.max(acc[2], b[2]),
+            Math.max(acc[3], b[3]),
+          ];
+        },
+        [Infinity, Infinity, -Infinity, -Infinity],
+      );
+      let allCrashes: Crash[] = [];
       try {
-        const all = await fetchKsiCrashes(padBBox(routeBox, 0.003));
-        near = crashesNearRoute(route.points, all);
+        allCrashes = await fetchKsiCrashes(padBBox(allBox, 0.003));
       } catch {
-        near = [];
+        allCrashes = [];
       }
       if (cancelled) return;
-      setNearCrashes(near);
-      if (!nearby.length && near.length === 0) {
-        setSafety({
-          corridorMeters: 0,
-          ratio: 0,
-          crashCount: 0,
-          fatalCount: 0,
-          crashesPerKm: 0,
-          level: 'low',
-          outOfArea: true,
-        });
-      } else {
-        setSafety(analyzeSafety(route.points, nearby, near));
-      }
+
+      const s = routes.map((r) => scoreRoute(r, corridors, allCrashes));
+      const bySafety = [...s].sort((a, b) => a.riskScore - b.riskScore);
+      bySafety.forEach((r, i) => {
+        r.rank = i;
+      });
+
+      setScored(s);
+      setActiveIdx(s.indexOf(bySafety[0]));
+      setOutOfArea(
+        corridors.length > 0 &&
+          allCrashes.length === 0 &&
+          s.every((r) => r.corridorMeters === 0),
+      );
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [route, corridors]);
+  }, [routes, corridors]);
 
   // Resolve the address if needed, then show the route for the chosen mode.
   async function handleRoute(mode: TravelMode) {
@@ -489,17 +558,17 @@ export default function App() {
         latitude: coords.current.lat,
         longitude: coords.current.lon,
       };
-      const found = await fetchRoute(
+      const found = await fetchRoutes(
         origin,
         { latitude: dest.latitude, longitude: dest.longitude },
         mode,
       );
-      if (!found) {
+      if (!found.length) {
         const label = mode === 'foot' ? 'walking' : 'biking';
         Alert.alert(`Could not find a ${label} route to that address.`);
         return;
       }
-      setRoute(found);
+      setRoutes(found);
     } catch {
       Alert.alert('Something went wrong loading directions.');
     } finally {
@@ -510,14 +579,14 @@ export default function App() {
   return (
     <View style={styles.container}>
       <View style={styles.searchBar}>
-        <Text style={styles.greeting}>hello, Zeus!!</Text>
+        <Text style={styles.greeting}>Welcome to Walkwise San Jose!!</Text>
         <View style={styles.inputRow}>
           <TextInput
             style={styles.input}
             value={address}
             onChangeText={(text) => {
               setSelected(null);
-              setRoute(null);
+              setRoutes([]);
               setAddress(text);
             }}
             placeholder="enter address here"
@@ -535,7 +604,7 @@ export default function App() {
           <Pressable
             style={({ pressed }) => [
               styles.modeButton,
-              route?.mode === 'foot' && styles.modeButtonActive,
+              routes[0]?.mode === 'foot' && styles.modeButtonActive,
               pressed && styles.modeButtonPressed,
             ]}
             onPress={() => handleRoute('foot')}
@@ -545,7 +614,7 @@ export default function App() {
           <Pressable
             style={({ pressed }) => [
               styles.modeButton,
-              route?.mode === 'bike' && styles.modeButtonActive,
+              routes[0]?.mode === 'bike' && styles.modeButtonActive,
               pressed && styles.modeButtonPressed,
             ]}
             onPress={() => handleRoute('bike')}
@@ -574,20 +643,60 @@ export default function App() {
           </View>
         )}
 
-        {selected && !route && (
+        {selected && !active && (
           <Text style={styles.coords}>
             {selected.latitude.toFixed(5)}, {selected.longitude.toFixed(5)}
           </Text>
         )}
 
-        {route && (
+        {scored.length > 1 && (
+          <View style={styles.routeChips}>
+            {scored.map((r, i) => (
+              <Pressable
+                key={`route-${i}`}
+                style={[
+                  styles.routeChip,
+                  i === activeIdx && styles.routeChipActive,
+                ]}
+                onPress={() => setActiveIdx(i)}
+              >
+                <View style={styles.routeChipTop}>
+                  <View
+                    style={[
+                      styles.safetyDot,
+                      { backgroundColor: safetyColor(r.level) },
+                    ]}
+                  />
+                  <Text style={styles.routeChipText}>
+                    {routesDiffer && r.rank === 0
+                      ? 'Calmest'
+                      : routesDiffer && r.rank === scored.length - 1
+                        ? 'Busier streets'
+                        : `Route ${i + 1}`}{' '}
+                    · {formatDuration(r.seconds)}
+                  </Text>
+                </View>
+                <Text style={styles.routeChipSub}>
+                  {Math.round(r.corridorRatio * 100)}% on busy main roads
+                  {r.crashCount
+                    ? ` · ${r.crashCount} extra-care spot${
+                        r.crashCount === 1 ? '' : 's'
+                      }`
+                    : ''}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        )}
+
+        {active && (
           <View style={styles.mapCard}>
             <MapView
               ref={mapRef}
               style={styles.map}
               initialRegion={{
-                latitude: route.points[0].latitude,
-                longitude: route.points[0].longitude,
+                latitude: active.points[0].latitude,
+                longitude: active.points[0].longitude,
                 latitudeDelta: 0.05,
                 longitudeDelta: 0.05,
               }}
@@ -596,83 +705,89 @@ export default function App() {
                 <Polyline
                   key={`corridor-${i}`}
                   coordinates={c.points}
-                  strokeColor="rgba(255,59,48,0.55)"
+                  strokeColor="rgba(255,159,10,0.5)"
                   strokeWidth={7}
                 />
               ))}
-              {nearCrashes.map((c, i) => (
+              {active.crashes.map((c, i) => (
                 <Circle
                   key={`crash-${i}`}
                   center={c.at}
-                  radius={c.fatal ? 28 : 16}
+                  radius={c.fatal ? 22 : 15}
                   strokeColor="rgba(0,0,0,0)"
                   fillColor={
-                    c.fatal ? 'rgba(255,45,85,0.9)' : 'rgba(255,149,0,0.75)'
+                    c.fatal ? 'rgba(255,120,90,0.85)' : 'rgba(255,179,64,0.75)'
                   }
                 />
               ))}
+              {scored.map((r, i) =>
+                i === activeIdx ? null : (
+                  <Polyline
+                    key={`alt-${i}`}
+                    coordinates={r.points}
+                    strokeColor={altColor(r.level)}
+                    strokeWidth={3}
+                    lineDashPattern={[6, 6]}
+                  />
+                ),
+              )}
               <Polyline
-                coordinates={route.points}
+                coordinates={active.points}
                 strokeColor="#007AFF"
-                strokeWidth={4}
+                strokeWidth={5}
               />
               <Marker
-                coordinate={route.points[0]}
+                coordinate={active.points[0]}
                 title="Start"
                 pinColor="#34C759"
               />
               <Marker
-                coordinate={route.points[route.points.length - 1]}
+                coordinate={active.points[active.points.length - 1]}
                 title={selected?.label ?? 'Destination'}
               />
             </MapView>
             <Text style={styles.routeMeta}>
-              {formatDistance(route.meters)} · {formatDuration(route.seconds)}{' '}
-              {route.mode === 'foot' ? 'walk' : 'bike ride'}
+              {formatDistance(active.meters)} · {formatDuration(active.seconds)}{' '}
+              {active.mode === 'foot' ? 'walk' : 'bike ride'}
+              {scored.length > 1 ? ` · route ${activeIdx + 1} of ${scored.length}` : ''}
             </Text>
 
-            {safety && (
-              <View style={styles.safetyBox}>
-                {safety.outOfArea ? (
-                  <Text style={styles.safetyMuted}>
-                    No San José safety data along this route.
-                  </Text>
-                ) : (
-                  <>
-                    <View style={styles.safetyRow}>
-                      <View
-                        style={[
-                          styles.safetyDot,
-                          { backgroundColor: safetyColor(safety.level) },
-                        ]}
-                      />
-                      <Text style={styles.safetyText}>
-                        {safety.corridorMeters >= 30
-                          ? `On priority safety corridors ${formatDistance(
-                              safety.corridorMeters,
-                            )} (${Math.round(safety.ratio * 100)}%)`
-                          : 'Mostly avoids priority safety corridors'}
-                      </Text>
-                    </View>
-                    <Text style={styles.safetyText}>
-                      {safety.crashCount === 0
-                        ? 'No severe/fatal crashes recorded alongside it'
-                        : `${safety.crashCount} killed/severe-injury crash${
-                            safety.crashCount === 1 ? '' : 'es'
-                          } within ${NEAR_CRASH_M} m (last 5 yrs)${
-                            safety.fatalCount
-                              ? ` · ${safety.fatalCount} fatal`
-                              : ''
-                          }`}
-                    </Text>
-                  </>
-                )}
+            <View style={styles.safetyBox}>
+              {outOfArea ? (
                 <Text style={styles.safetyMuted}>
-                  Red line = priority safety corridor · dot = KSI crash · City of
-                  San José Vision Zero
+                  No San José street data along this route.
                 </Text>
-              </View>
-            )}
+              ) : (
+                <>
+                  <View style={styles.safetyRow}>
+                    <View
+                      style={[
+                        styles.safetyDot,
+                        { backgroundColor: safetyColor(active.level) },
+                      ]}
+                    />
+                    <Text style={styles.safetyText}>
+                      {active.corridorMeters >= 30
+                        ? `Uses busy main roads for ${formatDistance(
+                            active.corridorMeters,
+                          )} (${Math.round(active.corridorRatio * 100)}%)`
+                        : 'Mostly on calmer streets'}
+                    </Text>
+                  </View>
+                  <Text style={styles.safetyText}>
+                    {active.crashCount === 0
+                      ? 'No extra-care spots flagged along this route'
+                      : `${active.crashCount} extra-care spot${
+                          active.crashCount === 1 ? '' : 's'
+                        } within ${NEAR_CRASH_M} m (City of San José data)`}
+                  </Text>
+                </>
+              )}
+              <Text style={styles.safetyMuted}>
+                Blue = your route · dashed = other options · amber line = busy
+                main road · dot = extra-care spot · City of San José data
+              </Text>
+            </View>
           </View>
         )}
       </View>
@@ -695,8 +810,8 @@ const styles = StyleSheet.create({
     paddingBottom: 12,
   },
   greeting: {
-    fontSize: 18,
-    fontWeight: '600',
+    fontSize: 26,
+    fontWeight: '700',
     color: '#000',
     marginBottom: 12,
   },
@@ -764,6 +879,37 @@ const styles = StyleSheet.create({
   coords: {
     marginTop: 8,
     fontSize: 13,
+    color: '#8E8E93',
+  },
+  routeChips: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 12,
+  },
+  routeChip: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#D1D1D6',
+    backgroundColor: '#fff',
+  },
+  routeChipActive: {
+    borderColor: '#007AFF',
+    backgroundColor: '#EAF3FF',
+  },
+  routeChipTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  routeChipText: {
+    fontSize: 13,
+    color: '#000',
+  },
+  routeChipSub: {
+    marginTop: 2,
+    fontSize: 11,
     color: '#8E8E93',
   },
   mapCard: {
