@@ -247,8 +247,12 @@ async function fetchRoutes(
   });
 }
 
+// US units: feet for short distances, miles (one decimal) beyond ~0.1 mi.
 function formatDistance(m: number): string {
-  return m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(1)} km`;
+  const miles = m / 1609.344;
+  return miles < 0.1
+    ? `${Math.round((m * 3.28084) / 10) * 10} ft`
+    : `${miles.toFixed(1)} mi`;
 }
 
 function formatDuration(s: number): string {
@@ -877,6 +881,7 @@ export default function App() {
 
   // Tapping a suggestion only gives us a place_id; resolve it to coordinates.
   async function handleSelect(item: Suggestion) {
+    Keyboard.dismiss();
     skipNextLookup.current = true;
     setAddress(item.label);
     setSuggestions([]);
@@ -1084,14 +1089,16 @@ export default function App() {
             Welcome to SafeRoutes San Jose, {USER_NAME}
           </Text>
 
-          <View style={styles.tabRow}>
+          <View style={styles.tabRow} accessibilityRole="tablist">
             <Pressable
-              style={[styles.tabButton, travelMode === 'walk' && styles.tabButtonActive]}
+              style={styles.tabButton}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: travelMode === 'walk' }}
               onPress={() => switchMode('walk')}
             >
               <MaterialIcons
                 name="directions-walk"
-                size={20}
+                size={28}
                 color={travelMode === 'walk' ? '#007AFF' : '#8E8E93'}
               />
               <Text
@@ -1102,14 +1109,22 @@ export default function App() {
               >
                 Walk
               </Text>
+              <View
+                style={[
+                  styles.tabIndicator,
+                  travelMode === 'walk' && styles.tabIndicatorActive,
+                ]}
+              />
             </Pressable>
             <Pressable
-              style={[styles.tabButton, travelMode === 'drive' && styles.tabButtonActive]}
+              style={styles.tabButton}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: travelMode === 'drive' }}
               onPress={() => switchMode('drive')}
             >
               <MaterialIcons
                 name="directions-car"
-                size={20}
+                size={28}
                 color={travelMode === 'drive' ? '#007AFF' : '#8E8E93'}
               />
               <Text
@@ -1120,6 +1135,12 @@ export default function App() {
               >
                 Drive
               </Text>
+              <View
+                style={[
+                  styles.tabIndicator,
+                  travelMode === 'drive' && styles.tabIndicatorActive,
+                ]}
+              />
             </Pressable>
           </View>
 
@@ -1160,6 +1181,38 @@ export default function App() {
               ))}
             </View>
           )}
+        </View>
+
+        <View style={[styles.controls, styles.controlsAboveMap]}>
+          <View style={[styles.modeRow, styles.modeRowAboveMap]}>
+            <Pressable
+              disabled={!canRoute}
+              style={({ pressed }) => [
+                styles.modeButton,
+                canRoute ? styles.modeButtonActive : styles.modeButtonDisabled,
+                pressed && styles.modeButtonPressed,
+              ]}
+              onPress={() => (travelMode === 'walk' ? handleRoute() : handleDriveCheck())}
+            >
+              <View style={styles.modeButtonContent}>
+                <MaterialIcons
+                  name={travelMode === 'walk' ? 'directions-walk' : 'directions-car'}
+                  size={26}
+                  color={canRoute ? '#fff' : styles.modeButtonTextDisabled.color}
+                />
+                <Text
+                  style={[
+                    styles.modeButtonText,
+                    !canRoute && styles.modeButtonTextDisabled,
+                  ]}
+                >
+                  {travelMode === 'walk' ? 'Find safe route' : 'Check for safety corridors'}
+                </Text>
+              </View>
+            </Pressable>
+          </View>
+
+          {loading && <ActivityIndicator style={styles.spinner} />}
         </View>
 
         <View style={styles.mapWrap}>
@@ -1289,36 +1342,6 @@ export default function App() {
         </Text>
 
         <View style={styles.controls}>
-          <View style={styles.modeRow}>
-            <Pressable
-              disabled={!canRoute}
-              style={({ pressed }) => [
-                styles.modeButton,
-                canRoute ? styles.modeButtonActive : styles.modeButtonDisabled,
-                pressed && styles.modeButtonPressed,
-              ]}
-              onPress={() => (travelMode === 'walk' ? handleRoute() : handleDriveCheck())}
-            >
-              <View style={styles.modeButtonContent}>
-                <MaterialIcons
-                  name={travelMode === 'walk' ? 'directions-walk' : 'directions-car'}
-                  size={26}
-                  color={canRoute ? '#fff' : styles.modeButtonTextDisabled.color}
-                />
-                <Text
-                  style={[
-                    styles.modeButtonText,
-                    !canRoute && styles.modeButtonTextDisabled,
-                  ]}
-                >
-                  {travelMode === 'walk' ? 'Find safe route' : 'Check for safety corridors'}
-                </Text>
-              </View>
-            </Pressable>
-          </View>
-
-          {loading && <ActivityIndicator style={styles.spinner} />}
-
           {selected && !shownRoute && (
             <Text style={styles.coords}>
               {selected.latitude.toFixed(5)}, {selected.longitude.toFixed(5)}
@@ -1417,7 +1440,7 @@ export default function App() {
                       ? 'No reported injury crashes along this route'
                       : `${active.crashCount} reported injury crash${
                           active.crashCount === 1 ? '' : 'es'
-                        } within ${NEAR_CRASH_M} m` +
+                        } within ${formatDistance(NEAR_CRASH_M)}` +
                         (active.ksiCount > 0
                           ? `, ${active.ksiCount} with a death or severe injury`
                           : '') +
@@ -1501,32 +1524,33 @@ const styles = StyleSheet.create({
   },
   tabRow: {
     flexDirection: 'row',
-    gap: 8,
-    marginBottom: 20,
+    marginBottom: 16,
   },
   tabButton: {
     flex: 1,
-    flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
-    gap: 6,
-    height: 38,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#D1D1D6',
-    backgroundColor: '#F2F2F7',
-  },
-  tabButtonActive: {
-    borderColor: '#007AFF',
-    backgroundColor: '#EAF3FF',
+    paddingTop: 6,
   },
   tabButtonText: {
-    fontSize: 15,
-    fontFamily: FONT.semibold,
+    marginTop: 2,
+    fontSize: 13,
+    fontFamily: FONT.medium,
     color: '#8E8E93',
   },
   tabButtonTextActive: {
+    fontFamily: FONT.semibold,
     color: '#007AFF',
+  },
+  // Reserves the indicator's space on both tabs so switching doesn't shift layout.
+  tabIndicator: {
+    marginTop: 6,
+    width: 24,
+    height: 3,
+    borderRadius: 2,
+    backgroundColor: 'transparent',
+  },
+  tabIndicatorActive: {
+    backgroundColor: '#007AFF',
   },
   inputRow: {
     flexDirection: 'row',
@@ -1551,6 +1575,12 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 8,
     marginTop: 20,
+  },
+  controlsAboveMap: {
+    marginBottom: 12,
+  },
+  modeRowAboveMap: {
+    marginTop: 0,
   },
   modeButton: {
     flex: 1,
