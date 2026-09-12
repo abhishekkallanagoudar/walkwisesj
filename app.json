@@ -9,8 +9,9 @@
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Your location is used to show nearby address suggestions and to alert you when you're near a safety corridor while walking a route."
-      }
+        "NSLocationWhenInUseUsageDescription": "Your location is used to show nearby address suggestions and as the starting point for your route."
+      },
+      "bundleIdentifier": "com.sumakg1.walkwisesj"
     },
     "android": {
       "permissions": [
@@ -22,15 +23,26 @@
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
-      }
+      },
+      "config": {
+        "googleMaps": {
+          "apiKey": "AIzaSyAc8qFjfPukR5HiGuCf4A3MG-EgzEkJt8c"
+        }
+      },
+      "package": "com.sumakg1.walkwisesj"
     },
     "web": {
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
       "expo-status-bar",
-      "expo-font",
-      "expo-notifications"
-    ]
+      "expo-font"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "f475d7cd-afba-4839-b7ca-7dc1eebf80d1"
+      }
+    },
+    "owner": "sumakg1"
   }
 }
