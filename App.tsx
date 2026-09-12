@@ -1,5 +1,7 @@
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
+import * as Notifications from 'expo-notifications';
+import { MaterialIcons } from '@expo/vector-icons';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -29,6 +31,17 @@ import { Poppins_600SemiBold, Poppins_700Bold } from '@expo-google-fonts/poppins
 // 'Fraunces_700Bold', 'Fraunces_900Black', 'Poppins_600SemiBold',
 // 'Poppins_700Bold'.
 const HEADING_FONT = 'Fraunces_900Black';
+
+// Show corridor-proximity alerts as a real banner even while the app is open.
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+    shouldShowBanner: true,
+    shouldShowList: true,
+  }),
+});
 
 type LatLng = { latitude: number; longitude: number };
 
@@ -247,6 +260,10 @@ const M_PER_DEG_LON = 111320 * Math.cos((37.3 * Math.PI) / 180);
 const ON_CORRIDOR_M = 25;
 // A crash within this many metres of the route counts as "along" it.
 const NEAR_CRASH_M = 40;
+// While actively walking a route, alert once the walker comes within this many
+// metres of a safety corridor (wider than ON_CORRIDOR_M, which just scores it,
+// so the alert gives some warning before actually stepping onto it).
+const ALERT_CORRIDOR_M = 60;
 
 // "Crash Locations Last Five Years" — every reported injury crash, not just the
 // killed-or-severely-injured ones. NOTE: San José only logs crashes inside its
@@ -288,6 +305,17 @@ function pointToSegMeters(p: LatLng, a: LatLng, b: LatLng): number {
   let t = len2 === 0 ? 0 : ((P.x - A.x) * dx + (P.y - A.y) * dy) / len2;
   t = Math.max(0, Math.min(1, t));
   return Math.hypot(P.x - (A.x + t * dx), P.y - (A.y + t * dy));
+}
+
+// Closest distance from a point (e.g. the walker's live location) to any
+// segment of a corridor.
+function distanceToCorridor(p: LatLng, corridor: Corridor): number {
+  let min = Infinity;
+  for (let i = 0; i < corridor.points.length - 1; i++) {
+    const d = pointToSegMeters(p, corridor.points[i], corridor.points[i + 1]);
+    if (d < min) min = d;
+  }
+  return min;
 }
 
 function bboxOf(pts: LatLng[]): BBox {
@@ -659,6 +687,59 @@ export default function App() {
     })();
   }, []);
 
+  // Ask for notification permission once on mount, so corridor alerts (below)
+  // don't need to interrupt with a permission prompt mid-walk.
+  useEffect(() => {
+    Notifications.requestPermissionsAsync().catch(() => {});
+  }, []);
+
+  // Corridors already alerted on during the current route detail view, so a
+  // moving fix doesn't fire the same corridor's notification repeatedly.
+  const alertedCorridors = useRef<Set<number>>(new Set());
+
+  // While the route detail screen is open, watch live location and notify the
+  // first time the walker comes near a safety corridor. Foreground only: this
+  // stops the moment the screen closes or the app is backgrounded.
+  useEffect(() => {
+    if (detailIdx === null || nearbyCorridors.length === 0) return;
+
+    alertedCorridors.current = new Set();
+    let subscription: Location.LocationSubscription | null = null;
+    let cancelled = false;
+
+    (async () => {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted' || cancelled) return;
+      subscription = await Location.watchPositionAsync(
+        { accuracy: Location.Accuracy.High, timeInterval: 5000, distanceInterval: 15 },
+        (pos) => {
+          const here: LatLng = {
+            latitude: pos.coords.latitude,
+            longitude: pos.coords.longitude,
+          };
+          nearbyCorridors.forEach((c, i) => {
+            if (alertedCorridors.current.has(i)) return;
+            if (distanceToCorridor(here, c) <= ALERT_CORRIDOR_M) {
+              alertedCorridors.current.add(i);
+              Notifications.scheduleNotificationAsync({
+                content: {
+                  title: 'Busy street ahead',
+                  body: `${c.name} is a high-injury safety corridor — stay alert.`,
+                },
+                trigger: null,
+              }).catch(() => {});
+            }
+          });
+        },
+      );
+    })();
+
+    return () => {
+      cancelled = true;
+      subscription?.remove();
+    };
+  }, [detailIdx, nearbyCorridors]);
+
   useEffect(() => {
     if (skipNextLookup.current) {
       skipNextLookup.current = false;
@@ -849,14 +930,21 @@ export default function App() {
             ]}
             onPress={() => handleRoute()}
           >
-            <Text
-              style={[
-                styles.modeButtonText,
-                !canRoute && styles.modeButtonTextDisabled,
-              ]}
-            >
-              Find safe route
-            </Text>
+            <View style={styles.modeButtonContent}>
+              <MaterialIcons
+                name="directions-walk"
+                size={26}
+                color={canRoute ? '#fff' : styles.modeButtonTextDisabled.color}
+              />
+              <Text
+                style={[
+                  styles.modeButtonText,
+                  !canRoute && styles.modeButtonTextDisabled,
+                ]}
+              >
+                Find safe route
+              </Text>
+            </View>
           </Pressable>
         </View>
 
@@ -1165,6 +1253,11 @@ const styles = StyleSheet.create({
   },
   modeButtonPressed: {
     opacity: 0.6,
+  },
+  modeButtonContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
   },
   modeButtonText: {
     color: '#fff',

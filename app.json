@@ -9,7 +9,7 @@
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Your location is used to show nearby address suggestions."
+        "NSLocationWhenInUseUsageDescription": "Your location is used to show nearby address suggestions and to alert you when you're near a safety corridor while walking a route."
       }
     },
     "android": {
@@ -29,7 +29,8 @@
     },
     "plugins": [
       "expo-status-bar",
-      "expo-font"
+      "expo-font",
+      "expo-notifications"
     ]
   }
 }
