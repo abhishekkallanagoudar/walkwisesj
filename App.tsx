@@ -16,7 +16,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import MapView, { Circle, Marker, Polyline } from 'react-native-maps';
+import MapView, { Marker, Polyline } from 'react-native-maps';
 import {
   useFonts,
   Poppins_400Regular,
@@ -74,10 +74,28 @@ type Corridor = {
 type CrashSeverity = 'fatal' | 'severe' | 'moderate' | 'minor';
 
 type Crash = {
+  id: number;
   at: LatLng;
   severity: CrashSeverity;
   weight: number; // fatal 8 / severe 4 / moderate 2 / minor 1
   ksi: boolean; // killed or severely injured
+  // Details shown when a crash dot is tapped.
+  dateMs: number | null; // San José local time, stored as if it were UTC
+  streets: string;
+  narrative: string;
+  collisionType: string;
+  involvedWith: string;
+  lighting: string;
+  weather: string;
+  hitAndRun: boolean;
+  speeding: boolean;
+};
+
+type MapRegion = {
+  latitude: number;
+  longitude: number;
+  latitudeDelta: number;
+  longitudeDelta: number;
 };
 
 type SafetyLevel = 'low' | 'medium' | 'high';
@@ -260,7 +278,27 @@ const NEAR_CRASH_M = 40;
 const CRASH_WHERE =
   'FATALINJURIES>0 OR SEVEREINJURIES>0 OR MODERATEINJURIES>0 OR MINORINJURIES>0';
 
-function crashesUrl(box: BBox): string {
+const CRASH_FIELDS = [
+  'OBJECTID',
+  'FATALINJURIES',
+  'SEVEREINJURIES',
+  'MODERATEINJURIES',
+  'MINORINJURIES',
+  'CRASHDATETIME',
+  'INTASTREETNAME',
+  'INTBSTREETNAME',
+  'NARRATIVE',
+  'COLLISIONTYPE',
+  'VEHICLEINVOLVEDWITH',
+  'LIGHTING',
+  'WEATHER',
+  'HITANDRUNFLAG',
+  'SPEEDINGFLAG',
+].join(',');
+
+// Newest first, so when a busy area hits the record limit the recent crashes
+// are the ones kept.
+function crashesUrl(box: BBox, limit: number): string {
   const geometry = box.join(',');
   return (
     'https://geo.sanjoseca.gov/server/rest/services/OPN/OPN_OpenDataService' +
@@ -268,9 +306,15 @@ function crashesUrl(box: BBox): string {
     encodeURIComponent(CRASH_WHERE) +
     `&geometry=${geometry}` +
     '&geometryType=esriGeometryEnvelope&inSR=4326&outSR=4326' +
-    '&outFields=FATALINJURIES,SEVEREINJURIES,MODERATEINJURIES,MINORINJURIES' +
-    '&resultRecordCount=2000&returnGeometry=true&f=geojson'
+    `&outFields=${CRASH_FIELDS}` +
+    '&orderByFields=CRASHDATETIME%20DESC' +
+    `&resultRecordCount=${limit}&returnGeometry=true&f=geojson`
   );
+}
+
+// The dataset stores street names in capitals ("SANTA CLARA ST").
+function titleCase(s: string): string {
+  return s.toLowerCase().replace(/\b[a-z]/g, (ch) => ch.toUpperCase());
 }
 
 function toXY(p: LatLng): { x: number; y: number } {
@@ -323,7 +367,7 @@ function padBBox(b: BBox, deg: number): BBox {
 }
 
 // A map region that frames a whole route with a little breathing room.
-function regionForRoute(pts: LatLng[]) {
+function regionForRoute(pts: LatLng[]): MapRegion {
   const [minLon, minLat, maxLon, maxLat] = bboxOf(pts);
   return {
     latitude: (minLat + maxLat) / 2,
@@ -360,8 +404,12 @@ async function fetchSafetyCorridors(): Promise<Corridor[]> {
   return out;
 }
 
-async function fetchCrashes(box: BBox): Promise<Crash[]> {
-  const res = await fetch(crashesUrl(box));
+async function fetchCrashes(
+  box: BBox,
+  limit = 2000,
+  signal?: AbortSignal,
+): Promise<Crash[]> {
+  const res = await fetch(crashesUrl(box, limit), { signal });
   const json = await res.json();
   const out: Crash[] = [];
   for (const f of json.features ?? []) {
@@ -379,10 +427,23 @@ async function fetchCrashes(box: BBox): Promise<Crash[]> {
           ? 'moderate'
           : 'minor';
     out.push({
+      id: Number(p.OBJECTID ?? out.length),
       at: { latitude: c[1], longitude: c[0] },
       severity,
       weight: fatal ? 8 : severe ? 4 : moderate ? 2 : 1,
       ksi: fatal || severe,
+      dateMs: typeof p.CRASHDATETIME === 'number' ? p.CRASHDATETIME : null,
+      streets: [p.INTASTREETNAME, p.INTBSTREETNAME]
+        .filter(Boolean)
+        .map(titleCase)
+        .join(' & '),
+      narrative: p.NARRATIVE ?? '',
+      collisionType: p.COLLISIONTYPE ?? '',
+      involvedWith: p.VEHICLEINVOLVEDWITH ?? '',
+      lighting: p.LIGHTING ?? '',
+      weather: p.WEATHER ?? '',
+      hitAndRun: p.HITANDRUNFLAG === 'True',
+      speeding: p.SPEEDINGFLAG === 'True',
     });
   }
   return out;
@@ -512,6 +573,60 @@ function altColor(level: SafetyLevel): string {
       : 'rgba(255,59,48,0.8)';
 }
 
+// --- Crash dots on the map ---
+
+// Where the map starts before the device location arrives: downtown San José.
+const DEFAULT_REGION: MapRegion = {
+  latitude: 37.3382,
+  longitude: -121.8863,
+  latitudeDelta: 0.03,
+  longitudeDelta: 0.03,
+};
+// Crash dots only load once the map is zoomed in at least this far, so a
+// city-wide view doesn't try to draw thousands of markers.
+const MAX_CRASH_DELTA = 0.06;
+const MAP_CRASH_LIMIT = 500;
+
+// Red = death or severe injury, orange = moderate, green = minor.
+function crashColor(c: Crash): string {
+  return c.ksi ? '#FF3B30' : c.severity === 'moderate' ? '#FF9500' : '#34C759';
+}
+
+function crashTitle(c: Crash): string {
+  switch (c.severity) {
+    case 'fatal':
+      return 'Fatal crash';
+    case 'severe':
+      return 'Severe injury crash';
+    case 'moderate':
+      return 'Moderate injury crash';
+    default:
+      return 'Minor injury crash';
+  }
+}
+
+function formatCrashDate(ms: number): string {
+  // The timestamp already holds local time, so format it as UTC to avoid
+  // shifting it by the phone's own time zone.
+  return new Date(ms).toLocaleString('en-US', {
+    timeZone: 'UTC',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
+function bboxOfRegion(r: MapRegion): BBox {
+  return [
+    r.longitude - r.longitudeDelta / 2,
+    r.latitude - r.latitudeDelta / 2,
+    r.longitude + r.longitudeDelta / 2,
+    r.latitude + r.latitudeDelta / 2,
+  ];
+}
+
 function googleMapsUrl(route: Route, mode: 'walking' | 'driving' = 'walking'): string {
   const pts = route.points;
   const at = (p: LatLng) => `${p.latitude},${p.longitude}`;
@@ -621,10 +736,8 @@ export default function App() {
   const [activeIdx, setActiveIdx] = useState(0);
   const [outOfArea, setOutOfArea] = useState(false);
   const [corridors, setCorridors] = useState<Corridor[]>([]);
-  // Drive's single route, scored just for its corridor overlap. The id bumps
-  // on every check so the map remounts and recenters on the new route.
+  // Drive's single route, scored just for its corridor overlap.
   const [driveResult, setDriveResult] = useState<ScoredRoute | null>(null);
-  const [driveCheckId, setDriveCheckId] = useState(0);
   // Current conditions near the route, fetched alongside it.
   const [weather, setWeather] = useState<Weather | null>(null);
   // Device location, used to bias results toward what's nearby. State (not a
@@ -634,6 +747,14 @@ export default function App() {
   );
   // Skip the lookup that would otherwise fire right after we set the text ourselves.
   const skipNextLookup = useRef(false);
+
+  const mapRef = useRef<MapView>(null);
+  // The map's current view, which decides which crash dots to load.
+  const [region, setRegion] = useState<MapRegion>(DEFAULT_REGION);
+  const [mapCrashes, setMapCrashes] = useState<Crash[]>([]);
+  // The crash dot the user tapped, shown in a details card under the map.
+  const [pickedCrash, setPickedCrash] = useState<Crash | null>(null);
+  const centeredOnUser = useRef(false);
 
   const active = scored[activeIdx] ?? null;
   // The route button stays disabled until there's an address to route to.
@@ -685,6 +806,43 @@ export default function App() {
       }
     })();
   }, []);
+
+  // Move the map to the user the first time their location arrives, unless a
+  // route is already being shown.
+  useEffect(() => {
+    if (!coords || centeredOnUser.current) return;
+    centeredOnUser.current = true;
+    if (scored.length || driveResult) return;
+    mapRef.current?.animateToRegion(
+      { ...DEFAULT_REGION, latitude: coords.lat, longitude: coords.lon },
+      400,
+    );
+  }, [coords, scored, driveResult]);
+
+  // Frame the route being shown whenever it changes.
+  useEffect(() => {
+    const pts = travelMode === 'walk' ? active?.points : driveResult?.points;
+    if (pts?.length) mapRef.current?.animateToRegion(regionForRoute(pts), 400);
+  }, [travelMode, active, driveResult]);
+
+  // Load the crash dots for whatever part of the map is in view, once the
+  // user stops panning.
+  useEffect(() => {
+    if (region.latitudeDelta > MAX_CRASH_DELTA) {
+      setMapCrashes([]);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      fetchCrashes(bboxOfRegion(region), MAP_CRASH_LIMIT, controller.signal)
+        .then(setMapCrashes)
+        .catch(() => {});
+    }, 400);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [region]);
 
   useEffect(() => {
     if (skipNextLookup.current) {
@@ -886,7 +1044,6 @@ export default function App() {
       }
       // No crash data for drive — keep it to just the corridor-overlap check.
       setDriveResult(scoreRoute(found[0], corridors, []));
-      setDriveCheckId((id) => id + 1);
     } catch {
       Alert.alert('Something went wrong checking the route.');
     } finally {
@@ -897,6 +1054,24 @@ export default function App() {
   if (!fontsLoaded) {
     return <View style={styles.container} />;
   }
+
+  // The route drawn on the map: the chosen walking option, or Drive's route.
+  const shownRoute: Route | null =
+    travelMode === 'walk' ? active : driveResult;
+  const crashDetails = pickedCrash
+    ? [
+        [
+          pickedCrash.collisionType,
+          pickedCrash.involvedWith && `with ${pickedCrash.involvedWith}`,
+        ]
+          .filter(Boolean)
+          .join(' '),
+        [pickedCrash.lighting, pickedCrash.weather].filter(Boolean).join(' · '),
+        [pickedCrash.hitAndRun && 'Hit and run', pickedCrash.speeding && 'Speeding']
+          .filter(Boolean)
+          .join(' · '),
+      ].filter(Boolean)
+    : [];
 
   return (
     <View style={styles.container}>
@@ -972,6 +1147,148 @@ export default function App() {
             />
           </View>
 
+          {suggestions.length > 0 && (
+            <View style={styles.suggestions}>
+              {suggestions.map((item) => (
+                <Pressable
+                  key={item.id}
+                  style={styles.suggestionRow}
+                  onPress={() => handleSelect(item)}
+                >
+                  <Text style={styles.suggestionText}>{item.label}</Text>
+                </Pressable>
+              ))}
+            </View>
+          )}
+        </View>
+
+        <View style={styles.mapWrap}>
+          <MapView
+            ref={mapRef}
+            style={styles.map}
+            initialRegion={DEFAULT_REGION}
+            showsUserLocation
+            onRegionChangeComplete={(r) => setRegion(r)}
+            onPress={(e) => {
+              // iOS also reports marker taps here; only a tap on empty map
+              // should close the details card.
+              if (e.nativeEvent.action !== 'marker-press') setPickedCrash(null);
+            }}
+          >
+            {nearbyCorridors.map((c, i) => (
+              <Polyline
+                key={`corridor-${i}`}
+                coordinates={c.points}
+                strokeColor="rgba(255,159,10,0.5)"
+                strokeWidth={7}
+              />
+            ))}
+            {travelMode === 'walk' &&
+              scored.map((r, i) =>
+                i === activeIdx ? null : (
+                  <Polyline
+                    key={`alt-${i}`}
+                    coordinates={r.points}
+                    strokeColor={altColor(r.level)}
+                    strokeWidth={3}
+                    lineDashPattern={[6, 6]}
+                  />
+                ),
+              )}
+            {shownRoute && (
+              <Polyline
+                coordinates={shownRoute.points}
+                strokeColor="#007AFF"
+                strokeWidth={5}
+              />
+            )}
+            {shownRoute && (
+              <Marker
+                coordinate={shownRoute.points[0]}
+                title="Start"
+                pinColor="#34C759"
+              />
+            )}
+            {shownRoute && (
+              <Marker
+                coordinate={shownRoute.points[shownRoute.points.length - 1]}
+                title={selected?.label ?? 'Destination'}
+              />
+            )}
+            {mapCrashes.map((c) => (
+              <Marker
+                key={`crash-${c.id}`}
+                coordinate={c.at}
+                anchor={{ x: 0.5, y: 0.5 }}
+                tracksViewChanges={false}
+                onPress={() => setPickedCrash(c)}
+              >
+                <View style={styles.crashHit}>
+                  <View style={[styles.crashDot, { backgroundColor: crashColor(c) }]} />
+                </View>
+              </Marker>
+            ))}
+          </MapView>
+
+          {region.latitudeDelta > MAX_CRASH_DELTA && (
+            <View style={styles.mapBadge}>
+              <Text style={styles.mapBadgeText}>Zoom in to see crash locations</Text>
+            </View>
+          )}
+        </View>
+
+        {pickedCrash && (
+          <View style={styles.crashCard}>
+            <View style={styles.crashCardHeader}>
+              <View
+                style={[styles.safetyDot, { backgroundColor: crashColor(pickedCrash) }]}
+              />
+              <Text style={styles.crashCardTitle}>{crashTitle(pickedCrash)}</Text>
+              <Pressable hitSlop={10} onPress={() => setPickedCrash(null)}>
+                <MaterialIcons name="close" size={20} color="#8E8E93" />
+              </Pressable>
+            </View>
+            {pickedCrash.dateMs !== null && (
+              <Text style={styles.crashCardMeta}>
+                {formatCrashDate(pickedCrash.dateMs)}
+              </Text>
+            )}
+            {pickedCrash.streets ? (
+              <Text style={styles.crashCardMeta}>Near {pickedCrash.streets}</Text>
+            ) : null}
+            {pickedCrash.narrative ? (
+              <Text style={styles.crashCardBody}>{pickedCrash.narrative}</Text>
+            ) : null}
+            {crashDetails.map((line) => (
+              <Text key={line} style={styles.crashCardMeta}>
+                {line}
+              </Text>
+            ))}
+          </View>
+        )}
+
+        <View style={styles.legendRow}>
+          <View style={styles.legendItem}>
+            <View style={[styles.safetyDot, { backgroundColor: '#FF3B30' }]} />
+            <Text style={styles.legendText}>Death or severe injury</Text>
+          </View>
+          <View style={styles.legendItem}>
+            <View style={[styles.safetyDot, { backgroundColor: '#FF9500' }]} />
+            <Text style={styles.legendText}>Moderate injury</Text>
+          </View>
+          <View style={styles.legendItem}>
+            <View style={[styles.safetyDot, { backgroundColor: '#34C759' }]} />
+            <Text style={styles.legendText}>Minor injury</Text>
+          </View>
+        </View>
+        <Text style={styles.legendNote}>
+          {mapCrashes.length >= MAP_CRASH_LIMIT
+            ? `Showing the ${MAP_CRASH_LIMIT} most recent crashes in view. Zoom in to see more. `
+            : ''}
+          Tap a dot for details. City of San José crash data, last five years.
+        </Text>
+
+        <View style={styles.controls}>
           <View style={styles.modeRow}>
             <Pressable
               disabled={!canRoute}
@@ -1002,21 +1319,7 @@ export default function App() {
 
           {loading && <ActivityIndicator style={styles.spinner} />}
 
-          {suggestions.length > 0 && (
-            <View style={styles.suggestions}>
-              {suggestions.map((item) => (
-                <Pressable
-                  key={item.id}
-                  style={styles.suggestionRow}
-                  onPress={() => handleSelect(item)}
-                >
-                  <Text style={styles.suggestionText}>{item.label}</Text>
-                </Pressable>
-              ))}
-            </View>
-          )}
-
-          {selected && !active && (
+          {selected && !shownRoute && (
             <Text style={styles.coords}>
               {selected.latitude.toFixed(5)}, {selected.longitude.toFixed(5)}
             </Text>
@@ -1063,73 +1366,6 @@ export default function App() {
 
         {travelMode === 'walk' && active && (
           <View style={styles.mapSection}>
-            <Text style={styles.mapTitle} numberOfLines={1}>
-              {routeName(active, scored.length)}
-            </Text>
-
-            <MapView
-              key={activeIdx}
-              style={styles.detailMap}
-              initialRegion={regionForRoute(active.points)}
-            >
-              {nearbyCorridors.map((c, i) => (
-                <Polyline
-                  key={`corridor-${i}`}
-                  coordinates={c.points}
-                  strokeColor="rgba(255,159,10,0.5)"
-                  strokeWidth={7}
-                />
-              ))}
-              {active.crashes.map((c, i) => (
-                <Circle
-                  key={`crash-${i}`}
-                  center={c.at}
-                  radius={
-                    c.severity === 'fatal'
-                      ? 24
-                      : c.severity === 'severe'
-                        ? 19
-                        : c.severity === 'moderate'
-                          ? 14
-                          : 10
-                  }
-                  strokeColor="rgba(0,0,0,0)"
-                  fillColor={
-                    c.ksi
-                      ? 'rgba(255,90,70,0.85)'
-                      : c.severity === 'moderate'
-                        ? 'rgba(255,150,50,0.8)'
-                        : 'rgba(255,190,80,0.7)'
-                  }
-                />
-              ))}
-              {scored.map((r, i) =>
-                i === activeIdx ? null : (
-                  <Polyline
-                    key={`alt-${i}`}
-                    coordinates={r.points}
-                    strokeColor={altColor(r.level)}
-                    strokeWidth={3}
-                    lineDashPattern={[6, 6]}
-                  />
-                ),
-              )}
-              <Polyline
-                coordinates={active.points}
-                strokeColor="#007AFF"
-                strokeWidth={5}
-              />
-              <Marker
-                coordinate={active.points[0]}
-                title="Start"
-                pinColor="#34C759"
-              />
-              <Marker
-                coordinate={active.points[active.points.length - 1]}
-                title={selected?.label ?? 'Destination'}
-              />
-            </MapView>
-
             <Text style={styles.routeMeta}>
               {formatDistance(active.meters)} ·{' '}
               {formatDuration(active.seconds)} walk
@@ -1191,8 +1427,7 @@ export default function App() {
               )}
               <Text style={styles.safetyMuted}>
                 Blue = this route · dashed = other options · amber line = busy
-                main road · dot = injury crash (red = death or severe) · City
-                of San José data
+                main road · City of San José data
               </Text>
             </View>
           </View>
@@ -1200,35 +1435,6 @@ export default function App() {
 
         {travelMode === 'drive' && driveResult && (
           <View style={styles.mapSection}>
-            <MapView
-              key={driveCheckId}
-              style={styles.detailMap}
-              initialRegion={regionForRoute(driveResult.points)}
-            >
-              {nearbyCorridors.map((c, i) => (
-                <Polyline
-                  key={`corridor-${i}`}
-                  coordinates={c.points}
-                  strokeColor="rgba(255,159,10,0.5)"
-                  strokeWidth={7}
-                />
-              ))}
-              <Polyline
-                coordinates={driveResult.points}
-                strokeColor="#007AFF"
-                strokeWidth={5}
-              />
-              <Marker
-                coordinate={driveResult.points[0]}
-                title="Start"
-                pinColor="#34C759"
-              />
-              <Marker
-                coordinate={driveResult.points[driveResult.points.length - 1]}
-                title={selected?.label ?? 'Destination'}
-              />
-            </MapView>
-
             <Text style={styles.routeMeta}>
               {formatDistance(driveResult.meters)} ·{' '}
               {formatDuration(driveResult.seconds)} drive
@@ -1338,10 +1544,13 @@ const styles = StyleSheet.create({
     backgroundColor: '#F2F2F7',
     color: '#000',
   },
+  controls: {
+    paddingHorizontal: 16,
+  },
   modeRow: {
     flexDirection: 'row',
     gap: 8,
-    marginTop: 32,
+    marginTop: 20,
   },
   modeButton: {
     flex: 1,
@@ -1444,16 +1653,96 @@ const styles = StyleSheet.create({
     borderTopColor: '#E5E5EA',
     paddingTop: 12,
   },
-  mapTitle: {
-    paddingHorizontal: 16,
-    marginBottom: 8,
-    fontSize: 17,
+  mapWrap: {
+    marginHorizontal: 16,
+    height: 320,
+    borderRadius: 12,
+    overflow: 'hidden',
+    backgroundColor: '#E5E5EA',
+  },
+  map: {
+    flex: 1,
+  },
+  mapBadge: {
+    position: 'absolute',
+    top: 10,
+    alignSelf: 'center',
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+  },
+  mapBadgeText: {
+    fontSize: 13,
+    fontFamily: FONT.medium,
+    color: '#fff',
+  },
+  // Transparent padding around each dot so it's easier to tap.
+  crashHit: {
+    padding: 6,
+  },
+  crashDot: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    borderWidth: 2,
+    borderColor: '#fff',
+  },
+  crashCard: {
+    marginHorizontal: 16,
+    marginTop: 10,
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#D1D1D6',
+    backgroundColor: '#fff',
+  },
+  crashCardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  crashCardTitle: {
+    flex: 1,
+    fontSize: 16,
     fontFamily: FONT.bold,
     color: '#000',
   },
-  detailMap: {
-    width: '100%',
-    height: 300,
+  crashCardMeta: {
+    marginTop: 2,
+    fontSize: 13,
+    fontFamily: FONT.regular,
+    color: '#8E8E93',
+  },
+  crashCardBody: {
+    marginVertical: 6,
+    fontSize: 14,
+    fontFamily: FONT.regular,
+    color: '#000',
+  },
+  legendRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    columnGap: 14,
+    rowGap: 4,
+    paddingHorizontal: 16,
+    marginTop: 10,
+  },
+  legendItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  legendText: {
+    fontSize: 12,
+    fontFamily: FONT.regular,
+    color: '#000',
+  },
+  legendNote: {
+    paddingHorizontal: 16,
+    marginTop: 4,
+    fontSize: 11,
+    fontFamily: FONT.regular,
+    color: '#8E8E93',
   },
   routeMeta: {
     paddingHorizontal: 16,
