@@ -39,16 +39,15 @@ const USER_NAME = 'User';
 
 type LatLng = { latitude: number; longitude: number };
 
+// An address match from the device geocoder, which already has coordinates.
 type Suggestion = {
   id: string;
   label: string;
-};
-
-// A suggestion once its place_id has been resolved to coordinates.
-type ResolvedPlace = Suggestion & {
   latitude: number;
   longitude: number;
 };
+
+type ResolvedPlace = Suggestion;
 
 type Step = {
   instruction: string;
@@ -62,7 +61,26 @@ type Route = {
   steps: Step[];
 };
 
-type TravelMode = 'walk' | 'drive';
+type TravelMode = 'walk' | 'bike' | 'drive';
+
+type GoogleTravelMode = 'walking' | 'bicycling' | 'driving';
+
+const GOOGLE_MODE: Record<TravelMode, GoogleTravelMode> = {
+  walk: 'walking',
+  bike: 'bicycling',
+  drive: 'driving',
+};
+
+// Tab order and labels for the travel mode switcher.
+const TRAVEL_TABS: {
+  mode: TravelMode;
+  label: string;
+  icon: 'directions-walk' | 'directions-bike' | 'directions-car';
+}[] = [
+  { mode: 'walk', label: 'Walk', icon: 'directions-walk' },
+  { mode: 'bike', label: 'Bike', icon: 'directions-bike' },
+  { mode: 'drive', label: 'Drive', icon: 'directions-car' },
+];
 
 type BBox = [number, number, number, number]; // minLon, minLat, maxLon, maxLat
 
@@ -119,132 +137,166 @@ type ScoredRoute = Route & {
   rank: number; // 0 = safest of the alternatives
 };
 
-// Google's Maps Platform key, for the Places and Directions REST calls below.
-const GOOGLE_MAPS_API_KEY = 'AIzaSyAc8qFjfPukR5HiGuCf4A3MG-EgzEkJt8c';
+// Search is keyless: Photon (komoot's free OpenStreetMap search, built for
+// search-as-you-type) first, then the phone's own geocoder if Photon is down
+// or finds nothing.
+const PHOTON_URL = 'https://photon.komoot.io/api/';
+// Santa Clara County, roughly. The safety data only covers San José, so
+// results from farther away aren't useful.
+const SEARCH_BBOX: BBox = [-122.21, 36.89, -121.2, 37.49];
 
-const PLACES_AUTOCOMPLETE_URL =
-  'https://maps.googleapis.com/maps/api/place/autocomplete/json';
-const PLACE_DETAILS_URL = 'https://maps.googleapis.com/maps/api/place/details/json';
+function dedupeByLabel(places: Suggestion[]): Suggestion[] {
+  const seen = new Set<string>();
+  return places.filter((p) => {
+    const key = p.label.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
-async function queryGooglePlaces(
+async function searchPhoton(
   query: string,
   bias: { lat: number; lon: number } | null,
   signal?: AbortSignal,
 ): Promise<Suggestion[]> {
   const params = new URLSearchParams({
-    input: query,
-    key: GOOGLE_MAPS_API_KEY,
-    // No `types` restriction: walkers search for businesses ("Starbucks") as
-    // often as street addresses, and `types=address` filters out anything
-    // that isn't a precise address, which drops POI/business names entirely.
+    q: query,
+    // Rank results near the user, or near downtown before location arrives.
+    lat: String(bias?.lat ?? DEFAULT_REGION.latitude),
+    lon: String(bias?.lon ?? DEFAULT_REGION.longitude),
+    bbox: SEARCH_BBOX.join(','),
+    limit: '10',
+    lang: 'en',
   });
-  if (bias) {
-    // Bias (not restrict) ranking toward the user's location.
-    params.set('location', `${bias.lat},${bias.lon}`);
-    params.set('radius', '20000');
-  }
-  const res = await fetch(`${PLACES_AUTOCOMPLETE_URL}?${params.toString()}`, {
-    signal,
-  });
+  const res = await fetch(`${PHOTON_URL}?${params.toString()}`, { signal });
   const json = await res.json();
-  if (json.status !== 'OK') return [];
-  const predictions: Suggestion[] = (json.predictions ?? []).map((p: any) => ({
-    id: p.place_id,
-    label: p.description,
-  }));
-  return predictions.slice(0, 6);
-}
-
-// Autocomplete predictions don't carry coordinates; resolve them only for
-// the one place actually chosen, via a Place Details lookup.
-async function resolvePlace(place: Suggestion): Promise<ResolvedPlace | null> {
-  const params = new URLSearchParams({
-    place_id: place.id,
-    key: GOOGLE_MAPS_API_KEY,
-    fields: 'geometry',
-  });
-  const res = await fetch(`${PLACE_DETAILS_URL}?${params.toString()}`);
-  const json = await res.json();
-  const loc = json.result?.geometry?.location;
-  if (json.status !== 'OK' || !loc) return null;
-  return { ...place, latitude: loc.lat, longitude: loc.lng };
-}
-
-const DIRECTIONS_URL = 'https://maps.googleapis.com/maps/api/directions/json';
-
-// Google encodes route geometry as a polyline string; this is its standard
-// decoding algorithm (see Google's Encoded Polyline Algorithm Format docs).
-function decodePolyline(encoded: string): LatLng[] {
-  const points: LatLng[] = [];
-  let index = 0;
-  let lat = 0;
-  let lng = 0;
-  while (index < encoded.length) {
-    let result = 1;
-    let shift = 0;
-    let b: number;
-    do {
-      b = encoded.charCodeAt(index++) - 63 - 1;
-      result += b << shift;
-      shift += 5;
-    } while (b >= 0x1f);
-    lat += result & 1 ? ~(result >> 1) : result >> 1;
-
-    result = 1;
-    shift = 0;
-    do {
-      b = encoded.charCodeAt(index++) - 63 - 1;
-      result += b << shift;
-      shift += 5;
-    } while (b >= 0x1f);
-    lng += result & 1 ? ~(result >> 1) : result >> 1;
-
-    points.push({ latitude: lat * 1e-5, longitude: lng * 1e-5 });
+  const places: Suggestion[] = [];
+  for (const f of json.features ?? []) {
+    const c = f.geometry?.coordinates;
+    const p = f.properties ?? {};
+    if (!Array.isArray(c) || c.length < 2) continue;
+    const street = [p.housenumber, p.street].filter(Boolean).join(' ');
+    // "Starbucks, 1751 North 1st Street, San Jose" / "Park Ave, San Jose".
+    const label = [p.name, street, p.city ?? p.district]
+      .filter((part, i, all) => part && all.indexOf(part) === i)
+      .join(', ');
+    if (!label) continue;
+    places.push({
+      id: `${p.osm_type}${p.osm_id}`,
+      label,
+      latitude: c[1],
+      longitude: c[0],
+    });
   }
-  return points;
+  return dedupeByLabel(places).slice(0, 6);
 }
 
-// Directions steps come as HTML (e.g. "Turn <b>right</b> onto Main St").
-function stripHtml(html: string): string {
-  return html.replace(/<[^>]+>/g, '');
+// Fallback: the phone's own geocoder (Apple's on iOS, the system Geocoder on
+// Android) through expo-location. It only matches complete addresses.
+function formatAddress(a: Location.LocationGeocodedAddress): string {
+  if (a.formattedAddress) return a.formattedAddress;
+  const street = a.name ?? [a.streetNumber, a.street].filter(Boolean).join(' ');
+  return [street, a.city, a.region].filter(Boolean).join(', ');
 }
 
-// Ask Google Directions for one or more routes, each with per-maneuver
-// steps, so we can both rank them for safety and show turn-by-turn
-// directions. Walk asks for alternatives to rank; Drive just needs the one
-// default route to check for corridor overlap.
+async function searchDevice(
+  query: string,
+  bias: { lat: number; lon: number } | null,
+): Promise<Suggestion[]> {
+  // Without a city the geocoder may pick a same-named street in another state.
+  const q = query.includes(',') ? query : `${query}, San Jose, CA`;
+  const results = await Location.geocodeAsync(q);
+  const center = bias ?? {
+    lat: DEFAULT_REGION.latitude,
+    lon: DEFAULT_REGION.longitude,
+  };
+  const byDistance = [...results].sort(
+    (a, b) =>
+      Math.hypot(a.latitude - center.lat, a.longitude - center.lon) -
+      Math.hypot(b.latitude - center.lat, b.longitude - center.lon),
+  );
+  const places = await Promise.all(
+    byDistance.slice(0, 4).map(async ({ latitude, longitude }) => {
+      let label = query;
+      try {
+        const [addr] = await Location.reverseGeocodeAsync({ latitude, longitude });
+        if (addr) label = formatAddress(addr) || query;
+      } catch {
+        // Keep the typed text as the label.
+      }
+      return { id: `${latitude},${longitude}`, label, latitude, longitude };
+    }),
+  );
+  return dedupeByLabel(places);
+}
+
+async function searchPlaces(
+  query: string,
+  bias: { lat: number; lon: number } | null,
+  signal?: AbortSignal,
+): Promise<Suggestion[]> {
+  try {
+    const found = await searchPhoton(query, bias, signal);
+    if (found.length) return found;
+  } catch (e) {
+    if (signal?.aborted) throw e;
+  }
+  return searchDevice(query, bias);
+}
+
+// Routing comes from the public OpenStreetMap routing servers (OSRM, run by
+// FOSSGIS), which are free and need no key.
+const OSRM_URL: Record<GoogleTravelMode, string> = {
+  walking: 'https://routing.openstreetmap.de/routed-foot/route/v1/foot',
+  bicycling: 'https://routing.openstreetmap.de/routed-bike/route/v1/bike',
+  driving: 'https://routing.openstreetmap.de/routed-car/route/v1/driving',
+};
+
+// OSRM describes each maneuver as a type/modifier pair plus a street name.
+function stepInstruction(s: any): string {
+  const type: string = s.maneuver?.type ?? '';
+  const modifier: string = s.maneuver?.modifier ?? '';
+  const onto = s.name ? ` onto ${s.name}` : '';
+  if (type === 'depart') return s.name ? `Start on ${s.name}` : 'Start';
+  if (type === 'arrive') return 'Arrive at your destination';
+  if (!modifier || modifier === 'straight') return `Continue${onto}`;
+  if (modifier === 'uturn') return `Make a U-turn${onto}`;
+  return `Turn ${modifier}${onto}`;
+}
+
+// Ask OSRM for one or more routes, each with per-maneuver steps, so we can
+// both rank them for safety and show turn-by-turn directions. Walk and Bike
+// ask for alternatives to rank; Drive just needs the one default route to
+// check for corridor overlap.
 async function fetchRoutes(
   from: LatLng,
   to: LatLng,
-  mode: 'walking' | 'driving' = 'walking',
+  mode: GoogleTravelMode = 'walking',
   alternatives = true,
 ): Promise<Route[]> {
+  const coords = `${from.longitude},${from.latitude};${to.longitude},${to.latitude}`;
   const params = new URLSearchParams({
-    origin: `${from.latitude},${from.longitude}`,
-    destination: `${to.latitude},${to.longitude}`,
-    mode,
+    overview: 'full',
+    geometries: 'geojson',
+    steps: 'true',
     alternatives: alternatives ? 'true' : 'false',
-    key: GOOGLE_MAPS_API_KEY,
   });
-  const res = await fetch(`${DIRECTIONS_URL}?${params.toString()}`);
+  const res = await fetch(`${OSRM_URL[mode]}/${coords}?${params.toString()}`);
   const json = await res.json();
   const rs = json.routes;
-  if (json.status !== 'OK' || !Array.isArray(rs) || rs.length === 0) return [];
-  return rs.map((r: any) => {
-    const legs = (r.legs ?? []) as any[];
-    return {
-      points: decodePolyline(r.overview_polyline?.points ?? ''),
-      meters: legs.reduce((sum, l) => sum + (l.distance?.value ?? 0), 0),
-      seconds: legs.reduce((sum, l) => sum + (l.duration?.value ?? 0), 0),
-      steps: legs
-        .flatMap((leg) => (leg.steps ?? []) as any[])
-        .map((s) => ({
-          instruction: stripHtml(s.html_instructions ?? ''),
-          meters: s.distance?.value ?? 0,
-        }))
-        .filter((s: Step) => s.instruction),
-    };
-  });
+  if (json.code !== 'Ok' || !Array.isArray(rs) || rs.length === 0) return [];
+  return rs.map((r: any) => ({
+    points: ((r.geometry?.coordinates ?? []) as number[][]).map(([lon, lat]) => ({
+      latitude: lat,
+      longitude: lon,
+    })),
+    meters: r.distance ?? 0,
+    seconds: r.duration ?? 0,
+    steps: ((r.legs ?? []) as any[])
+      .flatMap((leg) => (leg.steps ?? []) as any[])
+      .map((s) => ({ instruction: stepInstruction(s), meters: s.distance ?? 0 })),
+  }));
 }
 
 // US units: feet for short distances, miles (one decimal) beyond ~0.1 mi.
@@ -579,7 +631,7 @@ function altColor(level: SafetyLevel): string {
 
 // --- Crash dots on the map ---
 
-// Where the map starts before the device location arrives: downtown San José.
+// Where the map starts if the device location isn't available: downtown San José.
 const DEFAULT_REGION: MapRegion = {
   latitude: 37.3382,
   longitude: -121.8863,
@@ -631,7 +683,7 @@ function bboxOfRegion(r: MapRegion): BBox {
   ];
 }
 
-function googleMapsUrl(route: Route, mode: 'walking' | 'driving' = 'walking'): string {
+function googleMapsUrl(route: Route, mode: GoogleTravelMode = 'walking'): string {
   const pts = route.points;
   const at = (p: LatLng) => `${p.latitude},${p.longitude}`;
   const params = new URLSearchParams({
@@ -640,12 +692,12 @@ function googleMapsUrl(route: Route, mode: 'walking' | 'driving' = 'walking'): s
     destination: at(pts[pts.length - 1]),
     travelmode: mode,
   });
-  // Walking only: Google Maps has no way to accept a full custom path, so we
-  // pin a handful of points from this route as waypoints, keeping Google
-  // close to the calmest (or busier) line we picked instead of letting it
-  // choose its own route. Driving intentionally skips this — it's just
+  // Walking and biking only: Google Maps has no way to accept a full custom
+  // path, so we pin a handful of points from this route as waypoints, keeping
+  // Google close to the calmest (or busier) line we picked instead of letting
+  // it choose its own route. Driving intentionally skips this — it's just
   // Google's own default route, not one we ranked or chose.
-  if (mode === 'walking') {
+  if (mode !== 'driving') {
     const inner = pts.slice(1, -1);
     const want = Math.min(8, inner.length); // consumer Google Maps caps at ~9
     const waypoints: string[] = [];
@@ -658,7 +710,7 @@ function googleMapsUrl(route: Route, mode: 'walking' | 'driving' = 'walking'): s
   return `https://www.google.com/maps/dir/?${params.toString()}`;
 }
 
-function openInGoogleMaps(route: Route, mode: 'walking' | 'driving' = 'walking') {
+function openInGoogleMaps(route: Route, mode: GoogleTravelMode = 'walking') {
   Linking.openURL(googleMapsUrl(route, mode)).catch(() =>
     Alert.alert('Could not open Google Maps on this device.'),
   );
@@ -728,8 +780,8 @@ export default function App() {
     Poppins_600SemiBold,
     Poppins_700Bold,
   });
-  // Walk shows ranked alternatives with a full safety overlay; Drive is a
-  // single default route with just a corridor-overlap check.
+  // Walk and Bike show ranked alternatives with a full safety overlay; Drive
+  // is a single default route with just a corridor-overlap check.
   const [travelMode, setTravelMode] = useState<TravelMode>('walk');
   const [address, setAddress] = useState('');
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
@@ -758,9 +810,13 @@ export default function App() {
   const [mapCrashes, setMapCrashes] = useState<Crash[]>([]);
   // The crash dot the user tapped, shown in a details card under the map.
   const [pickedCrash, setPickedCrash] = useState<Crash | null>(null);
-  const centeredOnUser = useRef(false);
+  // The map waits for the location lookup to finish so it can open centered
+  // on the user instead of jumping there after it has already rendered.
+  const [locationChecked, setLocationChecked] = useState(false);
 
   const active = scored[activeIdx] ?? null;
+  // Walk and Bike rank alternatives for safety; Drive doesn't.
+  const ranksRoutes = travelMode !== 'drive';
   // The route button stays disabled until there's an address to route to.
   const canRoute = address.trim().length > 0;
 
@@ -773,10 +829,10 @@ export default function App() {
   }
 
   // Priority safety corridors near whichever route(s) are showing right now,
-  // for the map overlay — Walk's alternatives, or Drive's single route.
+  // for the map overlay — Walk/Bike alternatives, or Drive's single route.
   const nearbyCorridors = useMemo(() => {
     const routesShown: Route[] =
-      travelMode === 'walk' ? scored : driveResult ? [driveResult] : [];
+      ranksRoutes ? scored : driveResult ? [driveResult] : [];
     if (!routesShown.length) return [];
     const box = routesShown.reduce<BBox>(
       (acc, r) => {
@@ -791,43 +847,49 @@ export default function App() {
       [Infinity, Infinity, -Infinity, -Infinity],
     );
     return corridors.filter((c) => bboxIntersect(c.bbox, box, 0.003));
-  }, [travelMode, scored, driveResult, corridors]);
+  }, [ranksRoutes, scored, driveResult, corridors]);
 
-  // Ask for location once on mount so nearby results can be prioritized.
+  // Ask for location once on mount; it centers the map and biases search
+  // results toward what's nearby.
   useEffect(() => {
     (async () => {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') return;
       try {
-        const pos = await Location.getLastKnownPositionAsync();
-        const use = pos ?? (await Location.getCurrentPositionAsync({}));
-        setCoords({
-          lat: use.coords.latitude,
-          lon: use.coords.longitude,
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') return;
+        // A recent cached fix is instant; otherwise get a fresh one, but don't
+        // leave the map waiting forever if the GPS never answers.
+        const pos =
+          (await Location.getLastKnownPositionAsync({
+            maxAge: 60_000,
+            requiredAccuracy: 200,
+          })) ??
+          (await Promise.race([
+            Location.getCurrentPositionAsync({
+              accuracy: Location.Accuracy.Balanced,
+            }),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 10_000)),
+          ]));
+        if (!pos) return;
+        setCoords({ lat: pos.coords.latitude, lon: pos.coords.longitude });
+        setRegion({
+          ...DEFAULT_REGION,
+          latitude: pos.coords.latitude,
+          longitude: pos.coords.longitude,
         });
       } catch {
-        // No location available; searches just fall back to global ranking.
+        // No location available; the map stays on San José and searches
+        // fall back to global ranking.
+      } finally {
+        setLocationChecked(true);
       }
     })();
   }, []);
 
-  // Move the map to the user the first time their location arrives, unless a
-  // route is already being shown.
-  useEffect(() => {
-    if (!coords || centeredOnUser.current) return;
-    centeredOnUser.current = true;
-    if (scored.length || driveResult) return;
-    mapRef.current?.animateToRegion(
-      { ...DEFAULT_REGION, latitude: coords.lat, longitude: coords.lon },
-      400,
-    );
-  }, [coords, scored, driveResult]);
-
   // Frame the route being shown whenever it changes.
   useEffect(() => {
-    const pts = travelMode === 'walk' ? active?.points : driveResult?.points;
+    const pts = ranksRoutes ? active?.points : driveResult?.points;
     if (pts?.length) mapRef.current?.animateToRegion(regionForRoute(pts), 400);
-  }, [travelMode, active, driveResult]);
+  }, [ranksRoutes, active, driveResult]);
 
   // Load the crash dots for whatever part of the map is in view, once the
   // user stops panning.
@@ -861,17 +923,20 @@ export default function App() {
       return;
     }
 
+    // Photon requests are aborted when the text changes; the device-geocoder
+    // fallback can't be, so its late answers are ignored via the same signal.
     const controller = new AbortController();
     const timer = setTimeout(async () => {
       setLoading(true);
       try {
-        setSuggestions(await queryGooglePlaces(query, coords, controller.signal));
+        const found = await searchPlaces(query, coords, controller.signal);
+        if (!controller.signal.aborted) setSuggestions(found);
       } catch {
         if (!controller.signal.aborted) setSuggestions([]);
       } finally {
         setLoading(false);
       }
-    }, 350);
+    }, 300);
 
     return () => {
       clearTimeout(timer);
@@ -879,13 +944,12 @@ export default function App() {
     };
   }, [address, coords]);
 
-  // Tapping a suggestion only gives us a place_id; resolve it to coordinates.
-  async function handleSelect(item: Suggestion) {
+  function handleSelect(item: Suggestion) {
     Keyboard.dismiss();
     skipNextLookup.current = true;
     setAddress(item.label);
     setSuggestions([]);
-    setSelected(await resolvePlace(item));
+    setSelected(item);
   }
 
   // Load San José's priority safety corridors once.
@@ -959,12 +1023,11 @@ export default function App() {
   }, [routes, corridors]);
 
   // Resolves the address to coordinates, using the already-picked suggestion
-  // if there is one, otherwise looking up and resolving the top match.
+  // if there is one, otherwise geocoding the text and taking the closest match.
   async function resolveDestination(query: string): Promise<ResolvedPlace | null> {
     if (selected) return selected;
-    const results = await queryGooglePlaces(query, coords);
-    const first = results[0] ?? null;
-    const dest = first ? await resolvePlace(first) : null;
+    const results = await searchPlaces(query, coords);
+    const dest = results[0] ?? null;
     if (dest) {
       skipNextLookup.current = true;
       setAddress(dest.label);
@@ -1002,13 +1065,15 @@ export default function App() {
         longitude: (origin.longitude + destination.longitude) / 2,
       };
       const [found] = await Promise.all([
-        fetchRoutes(origin, destination),
+        fetchRoutes(origin, destination, GOOGLE_MODE[travelMode]),
         fetchWeather(midpoint)
           .then(setWeather)
           .catch(() => setWeather(null)),
       ]);
       if (!found.length) {
-        Alert.alert('Could not find a walking route to that address.');
+        Alert.alert(
+          `Could not find a ${travelMode === 'bike' ? 'bike' : 'walking'} route to that address.`,
+        );
         return;
       }
       setRoutes(found);
@@ -1060,9 +1125,10 @@ export default function App() {
     return <View style={styles.container} />;
   }
 
-  // The route drawn on the map: the chosen walking option, or Drive's route.
-  const shownRoute: Route | null =
-    travelMode === 'walk' ? active : driveResult;
+  // The route drawn on the map: the chosen walk/bike option, or Drive's route.
+  const shownRoute: Route | null = ranksRoutes ? active : driveResult;
+  const findRoute = () => (ranksRoutes ? handleRoute() : handleDriveCheck());
+  const currentTab = TRAVEL_TABS.find((t) => t.mode === travelMode)!;
   const crashDetails = pickedCrash
     ? [
         [
@@ -1090,58 +1156,32 @@ export default function App() {
           </Text>
 
           <View style={styles.tabRow} accessibilityRole="tablist">
-            <Pressable
-              style={styles.tabButton}
-              accessibilityRole="tab"
-              accessibilityState={{ selected: travelMode === 'walk' }}
-              onPress={() => switchMode('walk')}
-            >
-              <MaterialIcons
-                name="directions-walk"
-                size={28}
-                color={travelMode === 'walk' ? '#007AFF' : '#8E8E93'}
-              />
-              <Text
-                style={[
-                  styles.tabButtonText,
-                  travelMode === 'walk' && styles.tabButtonTextActive,
-                ]}
-              >
-                Walk
-              </Text>
-              <View
-                style={[
-                  styles.tabIndicator,
-                  travelMode === 'walk' && styles.tabIndicatorActive,
-                ]}
-              />
-            </Pressable>
-            <Pressable
-              style={styles.tabButton}
-              accessibilityRole="tab"
-              accessibilityState={{ selected: travelMode === 'drive' }}
-              onPress={() => switchMode('drive')}
-            >
-              <MaterialIcons
-                name="directions-car"
-                size={28}
-                color={travelMode === 'drive' ? '#007AFF' : '#8E8E93'}
-              />
-              <Text
-                style={[
-                  styles.tabButtonText,
-                  travelMode === 'drive' && styles.tabButtonTextActive,
-                ]}
-              >
-                Drive
-              </Text>
-              <View
-                style={[
-                  styles.tabIndicator,
-                  travelMode === 'drive' && styles.tabIndicatorActive,
-                ]}
-              />
-            </Pressable>
+            {TRAVEL_TABS.map(({ mode, label, icon }) => {
+              const isActive = travelMode === mode;
+              return (
+                <Pressable
+                  key={mode}
+                  style={styles.tabButton}
+                  accessibilityRole="tab"
+                  accessibilityState={{ selected: isActive }}
+                  onPress={() => switchMode(mode)}
+                >
+                  <MaterialIcons
+                    name={icon}
+                    size={28}
+                    color={isActive ? '#007AFF' : '#8E8E93'}
+                  />
+                  <Text
+                    style={[styles.tabButtonText, isActive && styles.tabButtonTextActive]}
+                  >
+                    {label}
+                  </Text>
+                  <View
+                    style={[styles.tabIndicator, isActive && styles.tabIndicatorActive]}
+                  />
+                </Pressable>
+              );
+            })}
           </View>
 
           <View style={styles.inputRow}>
@@ -1162,9 +1202,7 @@ export default function App() {
               returnKeyType="search"
               clearButtonMode="while-editing"
               selectTextOnFocus
-              onSubmitEditing={() =>
-                travelMode === 'walk' ? handleRoute() : handleDriveCheck()
-              }
+              onSubmitEditing={findRoute}
             />
           </View>
 
@@ -1192,11 +1230,11 @@ export default function App() {
                 canRoute ? styles.modeButtonActive : styles.modeButtonDisabled,
                 pressed && styles.modeButtonPressed,
               ]}
-              onPress={() => (travelMode === 'walk' ? handleRoute() : handleDriveCheck())}
+              onPress={findRoute}
             >
               <View style={styles.modeButtonContent}>
                 <MaterialIcons
-                  name={travelMode === 'walk' ? 'directions-walk' : 'directions-car'}
+                  name={currentTab.icon}
                   size={26}
                   color={canRoute ? '#fff' : styles.modeButtonTextDisabled.color}
                 />
@@ -1206,7 +1244,7 @@ export default function App() {
                     !canRoute && styles.modeButtonTextDisabled,
                   ]}
                 >
-                  {travelMode === 'walk' ? 'Find safe route' : 'Check for safety corridors'}
+                  {ranksRoutes ? 'Find safe route' : 'Check for safety corridors'}
                 </Text>
               </View>
             </Pressable>
@@ -1216,74 +1254,80 @@ export default function App() {
         </View>
 
         <View style={styles.mapWrap}>
-          <MapView
-            ref={mapRef}
-            style={styles.map}
-            initialRegion={DEFAULT_REGION}
-            showsUserLocation
-            onRegionChangeComplete={(r) => setRegion(r)}
-            onPress={(e) => {
-              // iOS also reports marker taps here; only a tap on empty map
-              // should close the details card.
-              if (e.nativeEvent.action !== 'marker-press') setPickedCrash(null);
-            }}
-          >
-            {nearbyCorridors.map((c, i) => (
-              <Polyline
-                key={`corridor-${i}`}
-                coordinates={c.points}
-                strokeColor="rgba(255,159,10,0.5)"
-                strokeWidth={7}
-              />
-            ))}
-            {travelMode === 'walk' &&
-              scored.map((r, i) =>
-                i === activeIdx ? null : (
-                  <Polyline
-                    key={`alt-${i}`}
-                    coordinates={r.points}
-                    strokeColor={altColor(r.level)}
-                    strokeWidth={3}
-                    lineDashPattern={[6, 6]}
-                  />
-                ),
+          {!locationChecked ? (
+            <ActivityIndicator style={styles.map} />
+          ) : (
+            <MapView
+              ref={mapRef}
+              style={styles.map}
+              // `region` holds the user's location here if it was found.
+              initialRegion={region}
+              showsUserLocation
+              showsMyLocationButton
+              onRegionChangeComplete={(r) => setRegion(r)}
+              onPress={(e) => {
+                // iOS also reports marker taps here; only a tap on empty map
+                // should close the details card.
+                if (e.nativeEvent.action !== 'marker-press') setPickedCrash(null);
+              }}
+            >
+              {nearbyCorridors.map((c, i) => (
+                <Polyline
+                  key={`corridor-${i}`}
+                  coordinates={c.points}
+                  strokeColor="rgba(255,159,10,0.5)"
+                  strokeWidth={7}
+                />
+              ))}
+              {ranksRoutes &&
+                scored.map((r, i) =>
+                  i === activeIdx ? null : (
+                    <Polyline
+                      key={`alt-${i}`}
+                      coordinates={r.points}
+                      strokeColor={altColor(r.level)}
+                      strokeWidth={3}
+                      lineDashPattern={[6, 6]}
+                    />
+                  ),
+                )}
+              {shownRoute && (
+                <Polyline
+                  coordinates={shownRoute.points}
+                  strokeColor="#007AFF"
+                  strokeWidth={5}
+                />
               )}
-            {shownRoute && (
-              <Polyline
-                coordinates={shownRoute.points}
-                strokeColor="#007AFF"
-                strokeWidth={5}
-              />
-            )}
-            {shownRoute && (
-              <Marker
-                coordinate={shownRoute.points[0]}
-                title="Start"
-                pinColor="#34C759"
-              />
-            )}
-            {shownRoute && (
-              <Marker
-                coordinate={shownRoute.points[shownRoute.points.length - 1]}
-                title={selected?.label ?? 'Destination'}
-              />
-            )}
-            {mapCrashes.map((c) => (
-              <Marker
-                key={`crash-${c.id}`}
-                coordinate={c.at}
-                anchor={{ x: 0.5, y: 0.5 }}
-                tracksViewChanges={false}
-                onPress={() => setPickedCrash(c)}
-              >
-                <View style={styles.crashHit}>
-                  <View style={[styles.crashDot, { backgroundColor: crashColor(c) }]} />
-                </View>
-              </Marker>
-            ))}
-          </MapView>
+              {shownRoute && (
+                <Marker
+                  coordinate={shownRoute.points[0]}
+                  title="Start"
+                  pinColor="#34C759"
+                />
+              )}
+              {shownRoute && (
+                <Marker
+                  coordinate={shownRoute.points[shownRoute.points.length - 1]}
+                  title={selected?.label ?? 'Destination'}
+                />
+              )}
+              {mapCrashes.map((c) => (
+                <Marker
+                  key={`crash-${c.id}`}
+                  coordinate={c.at}
+                  anchor={{ x: 0.5, y: 0.5 }}
+                  tracksViewChanges={false}
+                  onPress={() => setPickedCrash(c)}
+                >
+                  <View style={styles.crashHit}>
+                    <View style={[styles.crashDot, { backgroundColor: crashColor(c) }]} />
+                  </View>
+                </Marker>
+              ))}
+            </MapView>
+          )}
 
-          {region.latitudeDelta > MAX_CRASH_DELTA && (
+          {locationChecked && region.latitudeDelta > MAX_CRASH_DELTA && (
             <View style={styles.mapBadge}>
               <Text style={styles.mapBadgeText}>Zoom in to see crash locations</Text>
             </View>
@@ -1348,7 +1392,7 @@ export default function App() {
             </Text>
           )}
 
-          {travelMode === 'walk' && scored.length > 0 && (
+          {ranksRoutes && scored.length > 0 && (
             <View style={styles.routeChips}>
               {scored.map((r, i) => (
                 <Pressable
@@ -1387,11 +1431,11 @@ export default function App() {
           )}
         </View>
 
-        {travelMode === 'walk' && active && (
+        {ranksRoutes && active && (
           <View style={styles.mapSection}>
             <Text style={styles.routeMeta}>
               {formatDistance(active.meters)} ·{' '}
-              {formatDuration(active.seconds)} walk
+              {formatDuration(active.seconds)} {travelMode === 'bike' ? 'ride' : 'walk'}
             </Text>
 
             {weather && (
@@ -1405,7 +1449,7 @@ export default function App() {
                 styles.gmapsButton,
                 pressed && styles.modeButtonPressed,
               ]}
-              onPress={() => openInGoogleMaps(active)}
+              onPress={() => openInGoogleMaps(active, GOOGLE_MODE[travelMode])}
             >
               <Text style={styles.gmapsButtonText}>Open in Google Maps</Text>
             </Pressable>

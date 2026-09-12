@@ -24,11 +24,6 @@
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "config": {
-        "googleMaps": {
-          "apiKey": "AIzaSyAc8qFjfPukR5HiGuCf4A3MG-EgzEkJt8c"
-        }
-      },
       "package": "com.sumakg1.walkwisesj"
     },
     "web": {
