@@ -9,7 +9,7 @@
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Your location is used to show nearby address suggestions and as the starting point for your route."
+        "NSLocationWhenInUseUsageDescription": "Your location is used to show nearby address suggestions and as the starting point for your route, and to guide you turn by turn while navigating."
       },
       "bundleIdentifier": "com.sumakg1.walkwisesj"
     },

@@ -1,7 +1,9 @@
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
 import { MaterialIcons } from '@expo/vector-icons';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ComponentProps } from 'react';
+import * as Speech from 'expo-speech';
+import { useKeepAwake } from 'expo-keep-awake';
 import {
   ActivityIndicator,
   Alert,
@@ -19,19 +21,19 @@ import {
 import MapView, { Marker, Polyline } from 'react-native-maps';
 import {
   useFonts,
-  Poppins_400Regular,
-  Poppins_500Medium,
-  Poppins_600SemiBold,
-  Poppins_700Bold,
-} from '@expo-google-fonts/poppins';
+  Inter_400Regular,
+  Inter_500Medium,
+  Inter_600SemiBold,
+  Inter_700Bold,
+} from '@expo-google-fonts/inter';
 
 // App-wide typefaces. Custom fonts ignore fontWeight on Android, so each
 // weight is its own family.
 const FONT = {
-  regular: 'Poppins_400Regular',
-  medium: 'Poppins_500Medium',
-  semibold: 'Poppins_600SemiBold',
-  bold: 'Poppins_700Bold',
+  regular: 'Inter_400Regular',
+  medium: 'Inter_500Medium',
+  semibold: 'Inter_600SemiBold',
+  bold: 'Inter_700Bold',
 };
 const HEADING_FONT = FONT.bold;
 
@@ -52,6 +54,9 @@ type ResolvedPlace = Suggestion;
 type Step = {
   instruction: string;
   meters: number;
+  // OSRM maneuver, e.g. type 'turn' + modifier 'left'; picks the arrow icon.
+  type: string;
+  modifier: string;
 };
 
 type Route = {
@@ -96,7 +101,11 @@ type Crash = {
   at: LatLng;
   severity: CrashSeverity;
   weight: number; // fatal 8 / severe 4 / moderate 2 / minor 1
-  ksi: boolean; // killed or severely injured
+  highRisk: boolean; // fatal or severe; shown only as "High risk"
+  // Who was involved: walking (pedestrian), bike (bike or scooter rider) or
+  // drive (vehicles only). Each mode's routes are scored on its own crashes.
+  mode: TravelMode;
+  kind: string; // e.g. "Car and pedestrian"
   // Details shown when a crash dot is tapped.
   dateMs: number | null; // San José local time, stored as if it were UTC
   streets: string;
@@ -129,8 +138,9 @@ type ScoredRoute = Route & {
   crashes: Crash[];
   corridorMeters: number;
   corridorRatio: number;
+  segOnCorridor: boolean[]; // per route segment, whether it runs along a corridor
   crashCount: number;
-  ksiCount: number;
+  highRiskCount: number;
   weightedPerKm: number;
   level: SafetyLevel;
   riskScore: number; // lower = safer
@@ -274,13 +284,15 @@ async function fetchRoutes(
   to: LatLng,
   mode: GoogleTravelMode = 'walking',
   alternatives = true,
+  via: LatLng[] = [],
 ): Promise<Route[]> {
-  const coords = `${from.longitude},${from.latitude};${to.longitude},${to.latitude}`;
+  const coords = [from, ...via, to].map((p) => `${p.longitude},${p.latitude}`).join(';');
   const params = new URLSearchParams({
     overview: 'full',
     geometries: 'geojson',
     steps: 'true',
-    alternatives: alternatives ? 'true' : 'false',
+    // OSRM only offers alternatives between two points.
+    alternatives: alternatives && !via.length ? 'true' : 'false',
   });
   const res = await fetch(`${OSRM_URL[mode]}/${coords}?${params.toString()}`);
   const json = await res.json();
@@ -293,9 +305,25 @@ async function fetchRoutes(
     })),
     meters: r.distance ?? 0,
     seconds: r.duration ?? 0,
+    // A route through via points comes back as one leg per stretch. Drop the
+    // "arrive" at each via point, and treat the next leg's "depart" as a quiet
+    // street-name step, so navigation doesn't announce arriving mid-route.
     steps: ((r.legs ?? []) as any[])
-      .flatMap((leg) => (leg.steps ?? []) as any[])
-      .map((s) => ({ instruction: stepInstruction(s), meters: s.distance ?? 0 })),
+      .flatMap((leg, li, legs) =>
+        ((leg.steps ?? []) as any[])
+          .filter((s) => !(li < legs.length - 1 && s.maneuver?.type === 'arrive'))
+          .map((s) =>
+            li > 0 && s.maneuver?.type === 'depart'
+              ? { ...s, maneuver: { ...s.maneuver, type: 'new name', modifier: '' } }
+              : s,
+          ),
+      )
+      .map((s) => ({
+        instruction: stepInstruction(s),
+        meters: s.distance ?? 0,
+        type: s.maneuver?.type ?? '',
+        modifier: s.maneuver?.modifier ?? '',
+      })),
   }));
 }
 
@@ -346,20 +374,44 @@ const CRASH_FIELDS = [
   'NARRATIVE',
   'COLLISIONTYPE',
   'VEHICLEINVOLVEDWITH',
+  'VEHICLEPARTYCATEGORY',
   'LIGHTING',
   'WEATHER',
   'HITANDRUNFLAG',
   'SPEEDINGFLAG',
 ].join(',');
 
+// What the vehicle hit, for crashes involving someone walking or on a bike.
+// Wheelchairs, skateboards and kick scooters count as walking; e-bikes and
+// motorized scooters ride with bikes.
+const WALK_INVOLVED = ['Pedestrian', 'Wheelchair', 'Skateboard', 'Scooter Non-Motorized'];
+const BIKE_INVOLVED = ['Bike', 'Electric Bike', 'Scooter Motorized'];
+
+// Narrow the query to a mode's crashes on the server, so the map's record
+// limit isn't used up by crashes of other kinds. Drive is most of the data,
+// so it's filtered after loading instead (see crashMode). A crash between a
+// bike and a pedestrian matches both and counts as walking.
+const MODE_WHERE: Record<TravelMode, string> = {
+  walk:
+    "(VEHICLEPARTYCATEGORY LIKE '%Pedestrian%' OR COLLISIONTYPE = 'Vehicle/Pedestrian'" +
+    ` OR VEHICLEINVOLVEDWITH IN (${WALK_INVOLVED.map((v) => `'${v}'`).join(',')}))`,
+  bike:
+    "(VEHICLEPARTYCATEGORY LIKE '%Bicycle%' OR COLLISIONTYPE = 'Vehicle/Bike'" +
+    ` OR VEHICLEINVOLVEDWITH IN (${BIKE_INVOLVED.map((v) => `'${v}'`).join(',')}))`,
+  drive: '',
+};
+
 // Newest first, so when a busy area hits the record limit the recent crashes
 // are the ones kept.
-function crashesUrl(box: BBox, limit: number): string {
+function crashesUrl(box: BBox, limit: number, mode: TravelMode): string {
   const geometry = box.join(',');
+  const where = MODE_WHERE[mode]
+    ? `(${CRASH_WHERE}) AND ${MODE_WHERE[mode]}`
+    : CRASH_WHERE;
   return (
     'https://geo.sanjoseca.gov/server/rest/services/OPN/OPN_OpenDataService' +
     '/MapServer/553/query?where=' +
-    encodeURIComponent(CRASH_WHERE) +
+    encodeURIComponent(where) +
     `&geometry=${geometry}` +
     '&geometryType=esriGeometryEnvelope&inSR=4326&outSR=4326' +
     `&outFields=${CRASH_FIELDS}` +
@@ -460,12 +512,81 @@ async function fetchSafetyCorridors(): Promise<Corridor[]> {
   return out;
 }
 
+// Which travel mode a crash belongs to, from the parties involved
+// ("Pedestrian, Driver") and what the vehicle hit.
+function crashMode(p: any): TravelMode {
+  const parties: string = p.VEHICLEPARTYCATEGORY ?? '';
+  const involved: string = p.VEHICLEINVOLVEDWITH ?? '';
+  const type: string = p.COLLISIONTYPE ?? '';
+  if (
+    parties.includes('Pedestrian') ||
+    type === 'Vehicle/Pedestrian' ||
+    WALK_INVOLVED.includes(involved)
+  ) {
+    return 'walk';
+  }
+  if (
+    parties.includes('Bicycle') ||
+    type === 'Vehicle/Bike' ||
+    BIKE_INVOLVED.includes(involved)
+  ) {
+    return 'bike';
+  }
+  return 'drive';
+}
+
+const WALKER_NAME: Record<string, string> = {
+  Wheelchair: 'wheelchair user',
+  Skateboard: 'skateboarder',
+  'Scooter Non-Motorized': 'scooter rider',
+};
+const RIDER_NAME: Record<string, string> = {
+  'Electric Bike': 'e-bike',
+  'Scooter Motorized': 'e-scooter',
+};
+const DRIVE_HIT: Record<string, string> = {
+  'Other Vehicle': 'Car and car',
+  'Motor Vehicle On Other Roadway': 'Car and car',
+  'Parked Vehicle': 'Car and parked car',
+  'Fixed Object': 'Car and object',
+  'Other Object': 'Car and object',
+  Motorcycle: 'Car and motorcycle',
+  Train: 'Car and train',
+  'Light Rail Vehicle': 'Car and light rail',
+  Animal: 'Car and animal',
+  'Non-Collision': 'Single car',
+};
+
+// Short label for who was involved, e.g. "Car and pedestrian".
+function crashKind(p: any, mode: TravelMode): string {
+  const parties: string = p.VEHICLEPARTYCATEGORY ?? '';
+  const involved: string = p.VEHICLEINVOLVEDWITH ?? '';
+  const hasCar = parties === '' || parties.includes('Driver');
+  if (mode === 'walk') {
+    const walker = WALKER_NAME[involved] ?? 'pedestrian';
+    if (hasCar) return `Car and ${walker}`;
+    return parties.includes('Bicycle') ? `Bicycle and ${walker}` : `${walker} crash`;
+  }
+  if (mode === 'bike') {
+    const rider = RIDER_NAME[involved] ?? 'bicycle';
+    return hasCar ? `Car and ${rider}` : `${rider[0].toUpperCase()}${rider.slice(1)} crash`;
+  }
+  return DRIVE_HIT[involved] ?? 'Car crash';
+}
+
+// Narratives end with the outcome ("... pedestrian with fatality", "with
+// serious injuries"). The app only shows a risk level, so drop that part.
+function stripOutcome(narrative: string): string {
+  return narrative.replace(/\s+with\s+(fatalit|serious injur)[\s\S]*$/i, '').trim();
+}
+
 async function fetchCrashes(
   box: BBox,
+  mode: TravelMode,
   limit = 2000,
   signal?: AbortSignal,
 ): Promise<Crash[]> {
-  const res = await fetch(crashesUrl(box, limit), { signal });
+  const res = await fetch(crashesUrl(box, limit, mode), { signal });
   const json = await res.json();
   const out: Crash[] = [];
   for (const f of json.features ?? []) {
@@ -482,18 +603,22 @@ async function fetchCrashes(
         : moderate
           ? 'moderate'
           : 'minor';
+    const crashModeOf = crashMode(p);
+    if (crashModeOf !== mode) continue;
     out.push({
       id: Number(p.OBJECTID ?? out.length),
       at: { latitude: c[1], longitude: c[0] },
       severity,
       weight: fatal ? 8 : severe ? 4 : moderate ? 2 : 1,
-      ksi: fatal || severe,
+      highRisk: fatal || severe,
+      mode: crashModeOf,
+      kind: crashKind(p, crashModeOf),
       dateMs: typeof p.CRASHDATETIME === 'number' ? p.CRASHDATETIME : null,
       streets: [p.INTASTREETNAME, p.INTBSTREETNAME]
         .filter(Boolean)
         .map(titleCase)
         .join(' & '),
-      narrative: p.NARRATIVE ?? '',
+      narrative: stripOutcome(p.NARRATIVE ?? ''),
       collisionType: p.COLLISIONTYPE ?? '',
       involvedWith: p.VEHICLEINVOLVEDWITH ?? '',
       lighting: p.LIGHTING ?? '',
@@ -503,6 +628,20 @@ async function fetchCrashes(
     });
   }
   return out;
+}
+
+// Whether the city has any injury crashes on record in this box, of any kind.
+// None at all means the area is outside San José's data, not that it's safe.
+async function hasAnyCrashes(box: BBox): Promise<boolean> {
+  const res = await fetch(
+    'https://geo.sanjoseca.gov/server/rest/services/OPN/OPN_OpenDataService' +
+      '/MapServer/553/query?where=' +
+      encodeURIComponent(CRASH_WHERE) +
+      `&geometry=${box.join(',')}` +
+      '&geometryType=esriGeometryEnvelope&inSR=4326&returnCountOnly=true&f=json',
+  );
+  const json = await res.json();
+  return Number(json.count ?? 0) > 0;
 }
 
 function crashesNearRoute(routePts: LatLng[], all: Crash[]): Crash[] {
@@ -531,6 +670,7 @@ function scoreRoute(
 
   let total = 0;
   let onCorridor = 0;
+  const segOnCorridor: boolean[] = [];
   for (let i = 0; i < route.points.length - 1; i++) {
     const a = route.points[i];
     const b = route.points[i + 1];
@@ -551,20 +691,21 @@ function scoreRoute(
       }
     }
     if (near) onCorridor += segLen;
+    segOnCorridor.push(near);
   }
 
   const corridorRatio = total > 0 ? onCorridor / total : 0;
   const crashes = crashesNearRoute(route.points, allCrashes);
   const km = total / 1000;
   const crashCount = crashes.length;
-  const ksiCount = crashes.filter((c) => c.ksi).length;
+  const highRiskCount = crashes.filter((c) => c.highRisk).length;
   const crashWeight = crashes.reduce((sum, c) => sum + c.weight, 0);
   const weightedPerKm = km > 0 ? crashWeight / km : 0;
 
   // Amber on any injury history along the route; red where injuries are frequent
   // (severity-weighted) or anyone was killed or severely hurt.
   const high =
-    corridorRatio >= 0.25 || weightedPerKm >= 8 || ksiCount >= 1;
+    corridorRatio >= 0.25 || weightedPerKm >= 8 || highRiskCount >= 1;
   const medium =
     corridorRatio >= 0.05 || weightedPerKm >= 3 || crashCount >= 3;
   const level: SafetyLevel = high ? 'high' : medium ? 'medium' : 'low';
@@ -572,15 +713,16 @@ function scoreRoute(
   // Corridor exposure dominates the ranking; the weighted crash rate and any KSI
   // only separate routes whose corridor use is close.
   const riskScore =
-    corridorRatio * 10000 + weightedPerKm * 5 + ksiCount * 25;
+    corridorRatio * 10000 + weightedPerKm * 5 + highRiskCount * 25;
 
   return {
     ...route,
     crashes,
     corridorMeters: onCorridor,
     corridorRatio,
+    segOnCorridor,
     crashCount,
-    ksiCount,
+    highRiskCount,
     weightedPerKm,
     level,
     riskScore,
@@ -589,35 +731,180 @@ function scoreRoute(
 }
 
 // A route only counts as genuinely clear if it neither touches a safety
-// corridor nor has a nearby death/severe-injury crash — the two things that
-// actually draw alarming amber lines / red dots on the map.
+// corridor nor has a nearby high-risk crash — the two things that actually
+// draw alarming amber lines / red dots on the map.
 function isRouteClear(r: ScoredRoute): boolean {
-  return r.corridorMeters === 0 && r.ksiCount === 0;
+  return r.corridorMeters === 0 && r.highRiskCount === 0;
 }
 
-// Rank-based name for a route among its alternatives (0 = safest). If even
-// the top-ranked route isn't genuinely clear, don't oversell it as "Calmest".
+// Show at most this many alternatives, one per label, so no two match.
+const MAX_ROUTES = 3;
+
+// Safest first. A genuinely clear route (no corridor, no high-risk crash
+// nearby) always beats one that merely scores lower on the weighted risk
+// formula; equal risk goes to the quicker route, so the order is never a tie.
+function compareSafety(a: ScoredRoute, b: ScoredRoute): number {
+  const aClear = isRouteClear(a) ? 0 : 1;
+  const bClear = isRouteClear(b) ? 0 : 1;
+  if (aClear !== bClear) return aClear - bClear;
+  return a.riskScore - b.riskScore || a.seconds - b.seconds;
+}
+
+// A route showing the same time and distance as a lower-risk one is never
+// the better pick, so it's dropped.
+function rankRoutes(pool: ScoredRoute[]): ScoredRoute[] {
+  const shown: ScoredRoute[] = [];
+  for (const r of [...pool].sort(compareSafety)) {
+    const looksSame = shown.some(
+      (s) =>
+        formatDuration(s.seconds) === formatDuration(r.seconds) &&
+        formatDistance(s.meters) === formatDistance(r.meters),
+    );
+    if (!looksSame && shown.length < MAX_ROUTES) shown.push(r);
+  }
+  shown.forEach((r, i) => {
+    r.rank = i;
+  });
+  return shown;
+}
+
+// --- Safer detours ---
+// OSRM can't be told to avoid places. To steer around a danger spot, ask for
+// a route through a point off to its side (usually a parallel street), and
+// keep the result if it scores safer.
+
+// How far to the side of a danger spot to aim a detour.
+const DETOUR_OFFSET_M: Record<'walk' | 'bike', number> = { walk: 250, bike: 400 };
+// A detour may take at most 60% longer than the quickest route, and never
+// more than 15 extra minutes.
+const DETOUR_MAX_RATIO = 1.6;
+const DETOUR_MAX_EXTRA_S = 15 * 60;
+// Each round tries both sides of the worst spots on the current safest route;
+// if a round finds nothing safer, the next aims twice as far out.
+const DETOUR_ROUNDS = 2;
+const DETOUR_SPOTS = 2;
+// Danger spots closer together than this are treated as one.
+const SPOT_MERGE_M = 150;
+
+type DangerSpot = { at: LatLng; weight: number; seg: number };
+
+function fromXY(x: number, y: number): LatLng {
+  return { latitude: y / M_PER_DEG_LAT, longitude: x / M_PER_DEG_LON };
+}
+
+function nearestSeg(p: LatLng, pts: LatLng[]): number {
+  let best = 0;
+  let bestM = Infinity;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const m = pointToSegMeters(p, pts[i], pts[i + 1]);
+    if (m < bestM) {
+      bestM = m;
+      best = i;
+    }
+  }
+  return best;
+}
+
+// Where a route meets danger: medium- and high-risk crashes beside it, and
+// each stretch along a safety corridor (100 m counts like one severe crash).
+// Nearby spots are merged; heaviest first.
+function dangerSpots(r: ScoredRoute): DangerSpot[] {
+  const pts = r.points;
+  const raw: DangerSpot[] = [];
+  for (const c of r.crashes) {
+    if (c.weight >= 2) raw.push({ at: c.at, weight: c.weight, seg: nearestSeg(c.at, pts) });
+  }
+  let runStart = -1;
+  let runM = 0;
+  for (let i = 0; i <= r.segOnCorridor.length; i++) {
+    if (i < r.segOnCorridor.length && r.segOnCorridor[i]) {
+      if (runStart < 0) runStart = i;
+      runM += segMeters(pts[i], pts[i + 1]);
+    } else if (runStart >= 0) {
+      const mid = Math.floor((runStart + i) / 2);
+      raw.push({ at: pts[mid], weight: runM / 25, seg: mid });
+      runStart = -1;
+      runM = 0;
+    }
+  }
+  raw.sort((a, b) => b.weight - a.weight);
+  const merged: DangerSpot[] = [];
+  for (const spot of raw) {
+    const near = merged.find((m) => segMeters(m.at, spot.at) < SPOT_MERGE_M);
+    if (near) near.weight += spot.weight;
+    else merged.push({ ...spot });
+  }
+  return merged.sort((a, b) => b.weight - a.weight);
+}
+
+// Points offsetM to the left and right of a spot, across the route's general
+// direction there (measured over a few points, since single segments at a
+// corner point every which way).
+function sidePoints(spot: DangerSpot, pts: LatLng[], offsetM: number): LatLng[] {
+  const a = toXY(pts[Math.max(0, spot.seg - 5)]);
+  const b = toXY(pts[Math.min(pts.length - 1, spot.seg + 6)]);
+  const len = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+  const nx = -(b.y - a.y) / len;
+  const ny = (b.x - a.x) / len;
+  const P = toXY(spot.at);
+  return [1, -1].map((side) =>
+    fromXY(P.x + side * nx * offsetM, P.y + side * ny * offsetM),
+  );
+}
+
+// A route forced through a point can run up a dead end and straight back.
+function hasBacktrack(pts: LatLng[]): boolean {
+  for (let i = 0; i < pts.length; i++) {
+    let walked = 0;
+    for (let j = i + 1; j < Math.min(pts.length, i + 300); j++) {
+      walked += segMeters(pts[j - 1], pts[j]);
+      if (walked > 40 && segMeters(pts[i], pts[j]) < 5) return true;
+    }
+  }
+  return false;
+}
+
+// Share of a's points (sampled) that lie on b.
+function overlapShare(a: LatLng[], b: LatLng[]): number {
+  const step = Math.max(1, Math.floor(a.length / 40));
+  let sampled = 0;
+  let on = 0;
+  for (let i = 0; i < a.length; i += step) {
+    sampled++;
+    for (let j = 0; j < b.length - 1; j++) {
+      if (pointToSegMeters(a[i], b[j], b[j + 1]) <= 20) {
+        on++;
+        break;
+      }
+    }
+  }
+  return sampled ? on / sampled : 0;
+}
+
+function sameRoute(a: Route, b: Route): boolean {
+  return overlapShare(a.points, b.points) > 0.9 && overlapShare(b.points, a.points) > 0.9;
+}
+
+// The level a route is labeled and colored with. Alternatives are ranked
+// against each other so each gets a different label: of three, the safest is
+// Low risk, the next Medium risk, the last High risk. Of two, the second is
+// High risk only if it's risky on its own, otherwise Medium risk. A lone
+// route just uses its own level.
+function routeLevel(r: ScoredRoute, total: number): SafetyLevel {
+  if (total < 2) return r.level;
+  if (r.rank === 0) return 'low';
+  if (total === 2) return r.level === 'high' ? 'high' : 'medium';
+  return r.rank >= total - 1 ? 'high' : 'medium';
+}
+
 function routeName(r: ScoredRoute, total: number): string {
-  if (total < 2) return isRouteClear(r) ? 'Your route' : 'Moderately safe';
-  if (r.rank <= 0) return isRouteClear(r) ? 'Calmest' : 'Moderately safe';
-  if (r.rank >= total - 1) return 'Busier streets';
-  return 'Middle route';
+  const level = routeLevel(r, total);
+  return level === 'low' ? 'Low risk' : level === 'medium' ? 'Medium risk' : 'High risk';
 }
 
-// Calmest (green) -> middle (yellow) -> busiest (red).
+// Low risk (green) -> medium risk (yellow) -> high risk (red).
 function safetyColor(level: SafetyLevel): string {
   return level === 'low' ? '#34C759' : level === 'medium' ? '#FFCC00' : '#FF3B30';
-}
-
-// The dot shown next to each ranked alternative: rank-based among the current
-// alternatives — busiest is red, anything in between is yellow — but the top
-// rank only gets green if it's genuinely clear; otherwise yellow, matching
-// the "Moderately safe" label instead of a falsely reassuring green.
-function dotLevel(r: ScoredRoute, all: ScoredRoute[]): SafetyLevel {
-  if (all.length < 2) return isRouteClear(r) ? 'low' : 'medium';
-  if (r.rank === 0) return isRouteClear(r) ? 'low' : 'medium';
-  if (r.rank === all.length - 1) return 'high';
-  return 'medium';
 }
 
 // Translucent variant for the un-selected alternative routes.
@@ -643,22 +930,31 @@ const DEFAULT_REGION: MapRegion = {
 const MAX_CRASH_DELTA = 0.06;
 const MAP_CRASH_LIMIT = 500;
 
-// Red = death or severe injury, orange = moderate, green = minor.
-function crashColor(c: Crash): string {
-  return c.ksi ? '#FF3B30' : c.severity === 'moderate' ? '#FF9500' : '#34C759';
+// Severity is only ever shown as a risk level: high (fatal or severe) red,
+// medium (moderate) orange, low (minor) green.
+function crashRisk(c: Crash): 'High' | 'Medium' | 'Low' {
+  return c.highRisk ? 'High' : c.severity === 'moderate' ? 'Medium' : 'Low';
 }
 
+function crashColor(c: Crash): string {
+  const risk = crashRisk(c);
+  return risk === 'High' ? '#FF3B30' : risk === 'Medium' ? '#FF9500' : '#34C759';
+}
+
+// e.g. "High risk · Car and pedestrian"
 function crashTitle(c: Crash): string {
-  switch (c.severity) {
-    case 'fatal':
-      return 'Fatal crash';
-    case 'severe':
-      return 'Severe injury crash';
-    case 'moderate':
-      return 'Moderate injury crash';
-    default:
-      return 'Minor injury crash';
-  }
+  return `${crashRisk(c)} risk · ${c.kind}`;
+}
+
+// What to call a mode's crashes in route summaries.
+const CRASH_NOUN: Record<TravelMode, string> = {
+  walk: 'pedestrian',
+  bike: 'bike',
+  drive: 'car',
+};
+
+function crashCountText(n: number, mode: TravelMode): string {
+  return `${n} ${CRASH_NOUN[mode]} crash${n === 1 ? '' : 'es'}`;
 }
 
 function formatCrashDate(ms: number): string {
@@ -692,21 +988,9 @@ function googleMapsUrl(route: Route, mode: GoogleTravelMode = 'walking'): string
     destination: at(pts[pts.length - 1]),
     travelmode: mode,
   });
-  // Walking and biking only: Google Maps has no way to accept a full custom
-  // path, so we pin a handful of points from this route as waypoints, keeping
-  // Google close to the calmest (or busier) line we picked instead of letting
-  // it choose its own route. Driving intentionally skips this — it's just
-  // Google's own default route, not one we ranked or chose.
-  if (mode !== 'driving') {
-    const inner = pts.slice(1, -1);
-    const want = Math.min(8, inner.length); // consumer Google Maps caps at ~9
-    const waypoints: string[] = [];
-    for (let i = 1; i <= want; i++) {
-      const p = inner[Math.floor((i * inner.length) / (want + 1))];
-      if (p) waypoints.push(at(p));
-    }
-    if (waypoints.length) params.set('waypoints', waypoints.join('|'));
-  }
+  // Only Drive hands off to Google Maps, and it uses Google's own default
+  // route. Walk and Bike navigate in-app instead (NavigationView), since
+  // Google can only follow a custom path by turning it into stops.
   return `https://www.google.com/maps/dir/?${params.toString()}`;
 }
 
@@ -773,12 +1057,414 @@ async function fetchWeather(point: LatLng): Promise<Weather | null> {
   };
 }
 
+// --- Turn-by-turn navigation (Walk and Bike) ---
+
+type IconName = ComponentProps<typeof MaterialIcons>['name'];
+
+// Further than this from the route (or than the GPS accuracy, if worse) for
+// two fixes in a row counts as off route.
+const OFF_ROUTE_M = 30;
+// Within this many metres of the destination counts as arrived.
+const ARRIVE_M = 20;
+
+// Voice prompts give a heads-up `prealert` metres before a turn and announce
+// the turn itself at `now` metres. Bikes cover ground faster, so they hear it
+// earlier and see more of the map.
+const NAV_PROFILE: Record<
+  'walk' | 'bike',
+  { prealert: number; now: number; zoom: number; altitude: number }
+> = {
+  walk: { prealert: 60, now: 15, zoom: 18, altitude: 300 },
+  bike: { prealert: 150, now: 30, zoom: 17, altitude: 600 },
+};
+
+// Running distance along the route to each point, in segMeters' local scale.
+function cumulativeMeters(pts: LatLng[]): number[] {
+  const out = [0];
+  for (let i = 1; i < pts.length; i++) {
+    out.push(out[i - 1] + segMeters(pts[i - 1], pts[i]));
+  }
+  return out;
+}
+
+type RouteSnap = {
+  at: LatLng; // closest point on the route
+  along: number; // metres along the route to `at`
+  off: number; // metres from the user to `at`
+  seg: number; // index of the segment `at` lies on
+};
+
+// Closest point to p on route segments [from, to).
+function snapToRoute(
+  p: LatLng,
+  pts: LatLng[],
+  cum: number[],
+  from: number,
+  to: number,
+): RouteSnap {
+  const P = toXY(p);
+  let best: RouteSnap = { at: pts[0], along: 0, off: Infinity, seg: 0 };
+  const end = Math.min(pts.length - 1, to);
+  for (let i = Math.max(0, from); i < end; i++) {
+    const A = toXY(pts[i]);
+    const B = toXY(pts[i + 1]);
+    const dx = B.x - A.x;
+    const dy = B.y - A.y;
+    const len2 = dx * dx + dy * dy;
+    let t = len2 === 0 ? 0 : ((P.x - A.x) * dx + (P.y - A.y) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const off = Math.hypot(P.x - (A.x + t * dx), P.y - (A.y + t * dy));
+    if (off < best.off) {
+      best = {
+        at: {
+          latitude: pts[i].latitude + t * (pts[i + 1].latitude - pts[i].latitude),
+          longitude: pts[i].longitude + t * (pts[i + 1].longitude - pts[i].longitude),
+        },
+        along: cum[i] + t * Math.sqrt(len2),
+        off,
+        seg: i,
+      };
+    }
+  }
+  return best;
+}
+
+// Compass bearing from a to b, in degrees clockwise from north.
+function bearingDeg(a: LatLng, b: LatLng): number {
+  const A = toXY(a);
+  const B = toXY(b);
+  return ((Math.atan2(B.x - A.x, B.y - A.y) * 180) / Math.PI + 360) % 360;
+}
+
+function maneuverIcon(step: Step): IconName {
+  if (step.type === 'arrive') return 'place';
+  if (step.type === 'roundabout' || step.type === 'rotary') {
+    return step.modifier.includes('left') ? 'roundabout-left' : 'roundabout-right';
+  }
+  switch (step.modifier) {
+    case 'left':
+      return 'turn-left';
+    case 'right':
+      return 'turn-right';
+    case 'slight left':
+      return 'turn-slight-left';
+    case 'slight right':
+      return 'turn-slight-right';
+    case 'sharp left':
+      return 'turn-sharp-left';
+    case 'sharp right':
+      return 'turn-sharp-right';
+    case 'uturn':
+      return 'u-turn-left';
+    default:
+      return 'straight';
+  }
+}
+
+// "300 ft" reads aloud as "300 feet"; same for miles.
+function spokenDistance(m: number): string {
+  return formatDistance(m).replace(' ft', ' feet').replace(' mi', ' miles');
+}
+
+function lowerFirst(s: string): string {
+  return s.charAt(0).toLowerCase() + s.slice(1);
+}
+
+// Full-screen guidance along one route: a map that follows the user, the next
+// turn up top, voice prompts, and an off-route warning. Going off route points
+// the user back to the chosen line rather than rerouting, since a fresh route
+// from OSRM would be the fastest one, not the safest.
+function NavigationView({
+  route,
+  mode,
+  crashes,
+  destinationLabel,
+  onEnd,
+}: {
+  route: Route;
+  mode: 'walk' | 'bike';
+  crashes: Crash[];
+  destinationLabel: string;
+  onEnd: () => void;
+}) {
+  useKeepAwake();
+  const profile = NAV_PROFILE[mode];
+  const pts = route.points;
+  const destination = pts[pts.length - 1];
+  const mapRef = useRef<MapView>(null);
+  const cum = useMemo(() => cumulativeMeters(pts), [pts]);
+  const total = cum[cum.length - 1];
+  // Where along the route each step's maneuver happens. OSRM's step lengths
+  // tile the route end to end, so sum them and scale to our own measure.
+  const maneuverAt = useMemo(() => {
+    const sum = route.steps.reduce((acc, st) => acc + st.meters, 0);
+    const scale = sum > 0 ? total / sum : 1;
+    let acc = 0;
+    return route.steps.map((st) => {
+      const at = acc * scale;
+      acc += st.meters;
+      return at;
+    });
+  }, [route.steps, total]);
+
+  const [pos, setPos] = useState<LatLng | null>(null);
+  const [snap, setSnap] = useState<RouteSnap | null>(null);
+  const [offRoute, setOffRoute] = useState(false);
+  const [arrived, setArrived] = useState(false);
+  // Stops when the user drags the map; "Re-center" turns it back on.
+  const [following, setFollowing] = useState(true);
+  const [muted, setMuted] = useState(false);
+  const lastSeg = useRef(0);
+  const offFixes = useRef(0);
+  const heading = useRef(pts.length > 1 ? bearingDeg(pts[0], pts[1]) : 0);
+  // Keys of voice prompts already spoken, so each plays once.
+  const spoken = useRef(new Set<string>());
+
+  useEffect(() => {
+    let sub: Location.LocationSubscription | null = null;
+    let cancelled = false;
+    Location.watchPositionAsync(
+      {
+        accuracy: Location.Accuracy.BestForNavigation,
+        distanceInterval: 2,
+        timeInterval: 1000,
+      },
+      (loc) => {
+        const p = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
+        // Search near the last known spot first, so a route that doubles back
+        // on itself doesn't skip ahead; fall back to the whole route.
+        let s = snapToRoute(p, pts, cum, lastSeg.current - 5, lastSeg.current + 40);
+        if (s.off > OFF_ROUTE_M) {
+          const anywhere = snapToRoute(p, pts, cum, 0, pts.length);
+          if (anywhere.off < s.off) s = anywhere;
+        }
+        const off = s.off > Math.max(OFF_ROUTE_M, loc.coords.accuracy ?? 0);
+        offFixes.current = off ? offFixes.current + 1 : 0;
+        if (!off) {
+          lastSeg.current = s.seg;
+          heading.current = bearingDeg(pts[s.seg], pts[s.seg + 1]);
+        } else if ((loc.coords.heading ?? -1) >= 0) {
+          heading.current = loc.coords.heading!;
+        }
+        setPos(p);
+        setSnap(s);
+        setOffRoute(offFixes.current >= 2);
+      },
+    )
+      .then((s) => {
+        if (cancelled) s.remove();
+        else sub = s;
+      })
+      .catch(() => Alert.alert('Location access is needed for navigation.'));
+    return () => {
+      cancelled = true;
+      sub?.remove();
+      Speech.stop();
+    };
+  }, [pts, cum]);
+
+  const progress = snap?.along ?? 0;
+  const remaining = Math.max(0, total - progress);
+  // The next maneuver still ahead (step 0 is "Start", already behind us).
+  const nextIdx = maneuverAt.findIndex((at, i) => i > 0 && at > progress + 3);
+  const next = nextIdx >= 0 ? route.steps[nextIdx] : null;
+  const toNext = nextIdx >= 0 ? maneuverAt[nextIdx] - progress : 0;
+
+  // Voice prompts, each spoken once: the start, a heads-up before every turn,
+  // the turn itself, going off route, and arriving.
+  useEffect(() => {
+    if (!pos || !snap || arrived) return;
+    const say = (key: string, text: string) => {
+      if (spoken.current.has(key)) return;
+      spoken.current.add(key);
+      if (!muted) Speech.speak(text, { language: 'en-US' });
+    };
+    if (
+      segMeters(pos, destination) <= ARRIVE_M ||
+      (!offRoute && remaining <= ARRIVE_M)
+    ) {
+      setArrived(true);
+      say('arrive', 'You have arrived at your destination.');
+      return;
+    }
+    if (offRoute) {
+      say('off', "You're off route. Head back to the blue line.");
+      return;
+    }
+    spoken.current.delete('off');
+    say('start', route.steps[0]?.instruction ?? 'Start');
+    // OSRM marks plain street-name changes as steps; show them, don't speak them.
+    if (!next || next.type === 'new name') return;
+    if (toNext <= profile.now && next.type !== 'arrive') {
+      spoken.current.add(`pre-${nextIdx}`);
+      say(`now-${nextIdx}`, next.instruction);
+    } else if (toNext <= profile.prealert) {
+      say(`pre-${nextIdx}`, `In ${spokenDistance(toNext)}, ${lowerFirst(next.instruction)}`);
+    }
+  }, [pos, snap, offRoute, arrived, muted]);
+
+  function followCamera(p: LatLng) {
+    mapRef.current?.animateCamera(
+      {
+        center: p,
+        heading: heading.current,
+        pitch: 45,
+        zoom: profile.zoom, // Google Maps (Android)
+        altitude: profile.altitude, // Apple Maps (iOS)
+      },
+      { duration: 800 },
+    );
+  }
+
+  useEffect(() => {
+    if (pos && following) followCamera(pos);
+  }, [pos, following]);
+
+  // Grey behind the user, blue ahead.
+  const walked = snap ? [...pts.slice(0, snap.seg + 1), snap.at] : [];
+  const ahead = snap ? [snap.at, ...pts.slice(snap.seg + 1)] : pts;
+
+  let icon: IconName;
+  let headline: string;
+  let detail: string;
+  if (arrived) {
+    icon = 'place';
+    headline = "You've arrived";
+    detail = destinationLabel;
+  } else if (!snap) {
+    icon = 'my-location';
+    headline = 'Finding your location…';
+    detail = route.steps[0]?.instruction ?? '';
+  } else if (offRoute) {
+    icon = 'wrong-location';
+    headline = 'Off route';
+    detail = `Head back to the blue line · ${formatDistance(snap.off)} away`;
+  } else if (next) {
+    icon = maneuverIcon(next);
+    headline = formatDistance(toNext);
+    detail = next.instruction;
+  } else {
+    icon = 'straight';
+    headline = formatDistance(remaining);
+    detail = 'Continue to your destination';
+  }
+
+  const secondsLeft = total > 0 ? (route.seconds * remaining) / total : 0;
+  const arriveAt = new Date(Date.now() + secondsLeft * 1000).toLocaleTimeString([], {
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+
+  return (
+    <View style={styles.navScreen}>
+      <MapView
+        ref={mapRef}
+        style={StyleSheet.absoluteFill}
+        initialCamera={{
+          center: pts[0],
+          heading: heading.current,
+          pitch: 45,
+          zoom: profile.zoom,
+          altitude: profile.altitude,
+        }}
+        showsUserLocation
+        showsMyLocationButton={false}
+        showsCompass={false}
+        toolbarEnabled={false}
+        onPanDrag={() => setFollowing(false)}
+      >
+        {walked.length > 1 && (
+          <Polyline coordinates={walked} strokeColor="#8E8E93" strokeWidth={6} />
+        )}
+        <Polyline coordinates={ahead} strokeColor="#007AFF" strokeWidth={7} />
+        <Marker coordinate={destination} title={destinationLabel} />
+        {crashes.map((c) => (
+          <Marker
+            key={`nav-crash-${c.id}`}
+            coordinate={c.at}
+            anchor={{ x: 0.5, y: 0.5 }}
+            tracksViewChanges={false}
+          >
+            <View style={[styles.crashDot, { backgroundColor: crashColor(c) }]} />
+          </Marker>
+        ))}
+      </MapView>
+
+      <View
+        style={[
+          styles.navBanner,
+          offRoute && !arrived && styles.navBannerOff,
+          arrived && styles.navBannerArrived,
+        ]}
+      >
+        <MaterialIcons name={icon} size={44} color="#fff" />
+        <View style={styles.navBannerText}>
+          <Text style={styles.navHeadline}>{headline}</Text>
+          {detail ? (
+            <Text style={styles.navDetail} numberOfLines={2}>
+              {detail}
+            </Text>
+          ) : null}
+        </View>
+      </View>
+
+      <View style={styles.navBottom}>
+        {!following && (
+          <Pressable
+            style={styles.navRecenter}
+            onPress={() => {
+              setFollowing(true);
+              if (pos) followCamera(pos);
+            }}
+          >
+            <MaterialIcons name="navigation" size={18} color="#007AFF" />
+            <Text style={styles.navRecenterText}>Re-center</Text>
+          </Pressable>
+        )}
+        <View style={styles.navFooter}>
+          <View style={styles.navFooterText}>
+            <Text style={styles.navEta}>
+              {arrived ? 'Arrived' : formatDuration(secondsLeft)}
+            </Text>
+            {!arrived && (
+              <Text style={styles.navEtaSub}>
+                {formatDistance(remaining)} · arrive {arriveAt}
+              </Text>
+            )}
+          </View>
+          <Pressable
+            hitSlop={8}
+            style={styles.navIconButton}
+            accessibilityLabel={muted ? 'Unmute voice' : 'Mute voice'}
+            onPress={() => {
+              if (!muted) Speech.stop();
+              setMuted(!muted);
+            }}
+          >
+            <MaterialIcons
+              name={muted ? 'volume-off' : 'volume-up'}
+              size={24}
+              color="#3A3A3C"
+            />
+          </Pressable>
+          <Pressable
+            style={[styles.navEndButton, arrived && styles.navDoneButton]}
+            onPress={onEnd}
+          >
+            <Text style={styles.navEndText}>{arrived ? 'Done' : 'End'}</Text>
+          </Pressable>
+        </View>
+      </View>
+    </View>
+  );
+}
+
 export default function App() {
   const [fontsLoaded] = useFonts({
-    Poppins_400Regular,
-    Poppins_500Medium,
-    Poppins_600SemiBold,
-    Poppins_700Bold,
+    Inter_400Regular,
+    Inter_500Medium,
+    Inter_600SemiBold,
+    Inter_700Bold,
   });
   // Walk and Bike show ranked alternatives with a full safety overlay; Drive
   // is a single default route with just a corridor-overlap check.
@@ -786,6 +1472,8 @@ export default function App() {
   const [address, setAddress] = useState('');
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [loading, setLoading] = useState(false);
+  // While crash data loads and safer detours are tried for Walk/Bike.
+  const [findingSafer, setFindingSafer] = useState(false);
   const [selected, setSelected] = useState<ResolvedPlace | null>(null);
   const [routes, setRoutes] = useState<Route[]>([]);
   const [scored, setScored] = useState<ScoredRoute[]>([]);
@@ -804,6 +1492,38 @@ export default function App() {
   // Skip the lookup that would otherwise fire right after we set the text ourselves.
   const skipNextLookup = useRef(false);
 
+  // The address box sits below the map, where the keyboard would cover it.
+  // While it's focused, the page scrolls it up to the top of the screen, and
+  // bottom padding the height of the keyboard gives the page room to scroll.
+  const scrollRef = useRef<ScrollView>(null);
+  const addressY = useRef(0);
+  const addressFocused = useRef(false);
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+
+  function scrollToAddress() {
+    scrollRef.current?.scrollTo({
+      y: Math.max(0, addressY.current - TOP_INSET),
+      animated: true,
+    });
+  }
+
+  useEffect(() => {
+    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+    const show = Keyboard.addListener(showEvent, (e) =>
+      setKeyboardHeight(e.endCoordinates.height),
+    );
+    const hide = Keyboard.addListener(hideEvent, () => setKeyboardHeight(0));
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (keyboardHeight > 0 && addressFocused.current) scrollToAddress();
+  }, [keyboardHeight]);
+
   const mapRef = useRef<MapView>(null);
   // The map's current view, which decides which crash dots to load.
   const [region, setRegion] = useState<MapRegion>(DEFAULT_REGION);
@@ -813,6 +1533,8 @@ export default function App() {
   // The map waits for the location lookup to finish so it can open centered
   // on the user instead of jumping there after it has already rendered.
   const [locationChecked, setLocationChecked] = useState(false);
+  // Walk/Bike turn-by-turn guidance along the active route.
+  const [navigating, setNavigating] = useState(false);
 
   const active = scored[activeIdx] ?? null;
   // Walk and Bike rank alternatives for safety; Drive doesn't.
@@ -892,7 +1614,7 @@ export default function App() {
   }, [ranksRoutes, active, driveResult]);
 
   // Load the crash dots for whatever part of the map is in view, once the
-  // user stops panning.
+  // user stops panning. Only the current mode's crashes are shown.
   useEffect(() => {
     if (region.latitudeDelta > MAX_CRASH_DELTA) {
       setMapCrashes([]);
@@ -900,7 +1622,7 @@ export default function App() {
     }
     const controller = new AbortController();
     const timer = setTimeout(() => {
-      fetchCrashes(bboxOfRegion(region), MAP_CRASH_LIMIT, controller.signal)
+      fetchCrashes(bboxOfRegion(region), travelMode, MAP_CRASH_LIMIT, controller.signal)
         .then(setMapCrashes)
         .catch(() => {});
     }, 400);
@@ -908,7 +1630,7 @@ export default function App() {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [region]);
+  }, [region, travelMode]);
 
   useEffect(() => {
     if (skipNextLookup.current) {
@@ -960,18 +1682,23 @@ export default function App() {
   }, []);
 
   // Score every alternative against the Vision Zero safety corridors and the
-  // reported injury-crash history, then pick the safest as active.
+  // crash history for this mode only (pedestrian crashes for Walk, bike
+  // crashes for Bike), try detours around the worst spots, then pick the
+  // safest as active.
   useEffect(() => {
     if (!routes.length) {
       setScored([]);
       setActiveIdx(0);
       setOutOfArea(false);
+      setFindingSafer(false);
       return;
     }
 
     let cancelled = false;
+    setFindingSafer(true);
     (async () => {
-      // One crash fetch covering the bounding box of all alternatives.
+      const offsetM = DETOUR_OFFSET_M[travelMode === 'bike' ? 'bike' : 'walk'];
+      // One crash fetch covering all alternatives, wide enough for detours.
       const allBox = routes.reduce<BBox>(
         (acc, r) => {
           const b = bboxOf(r.points);
@@ -984,43 +1711,64 @@ export default function App() {
         },
         [Infinity, Infinity, -Infinity, -Infinity],
       );
+      const crashBox = padBBox(allBox, 0.003 + (offsetM * 2) / M_PER_DEG_LAT);
       let allCrashes: Crash[] = [];
+      let inCityData = true;
       try {
-        allCrashes = await fetchCrashes(padBBox(allBox, 0.003));
+        allCrashes = await fetchCrashes(crashBox, travelMode);
+        if (!allCrashes.length) inCityData = await hasAnyCrashes(crashBox);
       } catch {
         allCrashes = [];
       }
       if (cancelled) return;
 
-      const s = routes.map((r) => scoreRoute(r, corridors, allCrashes));
-      // Sort so the calmest route displays first, busiest last — but a
-      // genuinely clear route (no corridor, no KSI crash nearby) always beats
-      // one that merely scores lower on the weighted risk formula, so we
-      // never rank a route with visible injury/death markers as "Calmest"
-      // over one that has none at all.
-      const bySafety = [...s].sort((a, b) => {
-        const aClear = isRouteClear(a) ? 0 : 1;
-        const bClear = isRouteClear(b) ? 0 : 1;
-        if (aClear !== bClear) return aClear - bClear;
-        return a.riskScore - b.riskScore;
-      });
-      bySafety.forEach((r, i) => {
-        r.rank = i;
-      });
+      const score = (r: Route) => scoreRoute(r, corridors, allCrashes);
+      const pool = routes.map(score);
+      const outside =
+        corridors.length > 0 && !inCityData && pool.every((r) => r.corridorMeters === 0);
 
-      setScored(bySafety);
+      // Try routes through points beside the worst spots on the current safest
+      // route, keeping any that aren't too slow, don't double back, and aren't
+      // repeats. A second round works on whatever is safest after the first.
+      if (!outside) {
+        const origin = routes[0].points[0];
+        const dest = routes[0].points[routes[0].points.length - 1];
+        const fastest = Math.min(...routes.map((r) => r.seconds));
+        const maxSeconds = Math.min(fastest * DETOUR_MAX_RATIO, fastest + DETOUR_MAX_EXTRA_S);
+        let reach = offsetM;
+        for (let round = 0; round < DETOUR_ROUNDS; round++) {
+          const best = rankRoutes(pool)[0];
+          const vias = dangerSpots(best)
+            .slice(0, DETOUR_SPOTS)
+            .flatMap((spot) => sidePoints(spot, best.points, reach));
+          if (!vias.length) break;
+          const found = await Promise.all(
+            vias.map((v) =>
+              fetchRoutes(origin, dest, GOOGLE_MODE[travelMode], false, [v])
+                .then((rs) => rs[0] ?? null)
+                .catch(() => null),
+            ),
+          );
+          if (cancelled) return;
+          for (const r of found) {
+            if (!r || r.seconds > maxSeconds || hasBacktrack(r.points)) continue;
+            if (pool.some((p) => sameRoute(p, r))) continue;
+            pool.push(score(r));
+          }
+          if (rankRoutes(pool)[0] === best) reach *= 2;
+        }
+      }
+
+      setScored(rankRoutes(pool));
       setActiveIdx(0);
-      setOutOfArea(
-        corridors.length > 0 &&
-          allCrashes.length === 0 &&
-          s.every((r) => r.corridorMeters === 0),
-      );
+      setOutOfArea(outside);
+      setFindingSafer(false);
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [routes, corridors]);
+  }, [routes, corridors, travelMode]);
 
   // Resolves the address to coordinates, using the already-picked suggestion
   // if there is one, otherwise geocoding the text and taking the closest match.
@@ -1112,8 +1860,14 @@ export default function App() {
         Alert.alert('Could not find a driving route to that address.');
         return;
       }
-      // No crash data for drive — keep it to just the corridor-overlap check.
-      setDriveResult(scoreRoute(found[0], corridors, []));
+      // Drive is scored on vehicle-only crashes (car and car, car and object).
+      let carCrashes: Crash[] = [];
+      try {
+        carCrashes = await fetchCrashes(padBBox(bboxOf(found[0].points), 0.003), 'drive');
+      } catch {
+        carCrashes = [];
+      }
+      setDriveResult(scoreRoute(found[0], corridors, carCrashes));
     } catch {
       Alert.alert('Something went wrong checking the route.');
     } finally {
@@ -1125,6 +1879,21 @@ export default function App() {
     return <View style={styles.container} />;
   }
 
+  if (navigating && active) {
+    return (
+      <View style={styles.container}>
+        <NavigationView
+          route={active}
+          mode={travelMode === 'bike' ? 'bike' : 'walk'}
+          crashes={active.crashes}
+          destinationLabel={selected?.label ?? address}
+          onEnd={() => setNavigating(false)}
+        />
+        <StatusBar style="light" />
+      </View>
+    );
+  }
+
   // The route drawn on the map: the chosen walk/bike option, or Drive's route.
   const shownRoute: Route | null = ranksRoutes ? active : driveResult;
   const findRoute = () => (ranksRoutes ? handleRoute() : handleDriveCheck());
@@ -1132,8 +1901,11 @@ export default function App() {
   const crashDetails = pickedCrash
     ? [
         [
-          pickedCrash.collisionType,
-          pickedCrash.involvedWith && `with ${pickedCrash.involvedWith}`,
+          // "Vehicle/Pedestrian" just repeats the title; types like
+          // "Broadside" or "Rear End" add something.
+          pickedCrash.collisionType.startsWith('Vehicle/')
+            ? ''
+            : `${pickedCrash.collisionType} collision`,
         ]
           .filter(Boolean)
           .join(' '),
@@ -1147,7 +1919,11 @@ export default function App() {
   return (
     <View style={styles.container}>
       <ScrollView
-        contentContainerStyle={styles.scrollBody}
+        ref={scrollRef}
+        contentContainerStyle={[
+          styles.scrollBody,
+          keyboardHeight > 0 && { paddingBottom: keyboardHeight + 32 },
+        ]}
         keyboardShouldPersistTaps="handled"
       >
         <View style={styles.searchBar}>
@@ -1183,74 +1959,6 @@ export default function App() {
               );
             })}
           </View>
-
-          <View style={styles.inputRow}>
-            <TextInput
-              style={styles.input}
-              value={address}
-              onChangeText={(text) => {
-                setSelected(null);
-                setRoutes([]);
-                setDriveResult(null);
-                setWeather(null);
-                setAddress(text);
-              }}
-              placeholder="enter address here"
-              placeholderTextColor="#8E8E93"
-              autoCorrect={false}
-              autoCapitalize="words"
-              returnKeyType="search"
-              clearButtonMode="while-editing"
-              selectTextOnFocus
-              onSubmitEditing={findRoute}
-            />
-          </View>
-
-          {suggestions.length > 0 && (
-            <View style={styles.suggestions}>
-              {suggestions.map((item) => (
-                <Pressable
-                  key={item.id}
-                  style={styles.suggestionRow}
-                  onPress={() => handleSelect(item)}
-                >
-                  <Text style={styles.suggestionText}>{item.label}</Text>
-                </Pressable>
-              ))}
-            </View>
-          )}
-        </View>
-
-        <View style={[styles.controls, styles.controlsAboveMap]}>
-          <View style={[styles.modeRow, styles.modeRowAboveMap]}>
-            <Pressable
-              disabled={!canRoute}
-              style={({ pressed }) => [
-                styles.modeButton,
-                canRoute ? styles.modeButtonActive : styles.modeButtonDisabled,
-                pressed && styles.modeButtonPressed,
-              ]}
-              onPress={findRoute}
-            >
-              <View style={styles.modeButtonContent}>
-                <MaterialIcons
-                  name={currentTab.icon}
-                  size={26}
-                  color={canRoute ? '#fff' : styles.modeButtonTextDisabled.color}
-                />
-                <Text
-                  style={[
-                    styles.modeButtonText,
-                    !canRoute && styles.modeButtonTextDisabled,
-                  ]}
-                >
-                  {ranksRoutes ? 'Find safe route' : 'Check for safety corridors'}
-                </Text>
-              </View>
-            </Pressable>
-          </View>
-
-          {loading && <ActivityIndicator style={styles.spinner} />}
         </View>
 
         <View style={styles.mapWrap}>
@@ -1285,7 +1993,7 @@ export default function App() {
                     <Polyline
                       key={`alt-${i}`}
                       coordinates={r.points}
-                      strokeColor={altColor(r.level)}
+                      strokeColor={altColor(routeLevel(r, scored.length))}
                       strokeWidth={3}
                       lineDashPattern={[6, 6]}
                     />
@@ -1364,25 +2072,113 @@ export default function App() {
           </View>
         )}
 
+        <View
+          style={styles.addressSection}
+          onLayout={(e) => {
+            addressY.current = e.nativeEvent.layout.y;
+          }}
+        >
+          <View style={styles.inputRow}>
+            <TextInput
+              style={styles.input}
+              value={address}
+              onChangeText={(text) => {
+                setSelected(null);
+                setRoutes([]);
+                setDriveResult(null);
+                setWeather(null);
+                setAddress(text);
+              }}
+              placeholder="enter address here"
+              placeholderTextColor="#8E8E93"
+              autoCorrect={false}
+              autoCapitalize="words"
+              returnKeyType="search"
+              clearButtonMode="while-editing"
+              selectTextOnFocus
+              onFocus={() => {
+                addressFocused.current = true;
+                // Already open (e.g. coming back from another field): scroll now.
+                if (keyboardHeight > 0) scrollToAddress();
+              }}
+              onBlur={() => {
+                addressFocused.current = false;
+              }}
+              onSubmitEditing={findRoute}
+            />
+          </View>
+
+          {suggestions.length > 0 && (
+            <View style={styles.suggestions}>
+              {suggestions.map((item) => (
+                <Pressable
+                  key={item.id}
+                  style={styles.suggestionRow}
+                  onPress={() => handleSelect(item)}
+                >
+                  <Text style={styles.suggestionText}>{item.label}</Text>
+                </Pressable>
+              ))}
+            </View>
+          )}
+
+          <View style={styles.modeRow}>
+            <Pressable
+              disabled={!canRoute}
+              style={({ pressed }) => [
+                styles.modeButton,
+                canRoute ? styles.modeButtonActive : styles.modeButtonDisabled,
+                pressed && styles.modeButtonPressed,
+              ]}
+              onPress={findRoute}
+            >
+              <View style={styles.modeButtonContent}>
+                <MaterialIcons
+                  name={currentTab.icon}
+                  size={26}
+                  color={canRoute ? '#fff' : styles.modeButtonTextDisabled.color}
+                />
+                <Text
+                  style={[
+                    styles.modeButtonText,
+                    !canRoute && styles.modeButtonTextDisabled,
+                  ]}
+                >
+                  {ranksRoutes ? 'Find safe route' : 'Check for safety corridors'}
+                </Text>
+              </View>
+            </Pressable>
+          </View>
+
+          {loading && <ActivityIndicator style={styles.spinner} />}
+          {findingSafer && (
+            <View style={styles.findingRow}>
+              <ActivityIndicator />
+              <Text style={styles.findingText}>Looking for lower-risk streets…</Text>
+            </View>
+          )}
+        </View>
+
         <View style={styles.legendRow}>
           <View style={styles.legendItem}>
             <View style={[styles.safetyDot, { backgroundColor: '#FF3B30' }]} />
-            <Text style={styles.legendText}>Death or severe injury</Text>
+            <Text style={styles.legendText}>High risk</Text>
           </View>
           <View style={styles.legendItem}>
             <View style={[styles.safetyDot, { backgroundColor: '#FF9500' }]} />
-            <Text style={styles.legendText}>Moderate injury</Text>
+            <Text style={styles.legendText}>Medium risk</Text>
           </View>
           <View style={styles.legendItem}>
             <View style={[styles.safetyDot, { backgroundColor: '#34C759' }]} />
-            <Text style={styles.legendText}>Minor injury</Text>
+            <Text style={styles.legendText}>Low risk</Text>
           </View>
         </View>
         <Text style={styles.legendNote}>
           {mapCrashes.length >= MAP_CRASH_LIMIT
             ? `Showing the ${MAP_CRASH_LIMIT} most recent crashes in view. Zoom in to see more. `
             : ''}
-          Tap a dot for details. City of San José crash data, last five years.
+          Showing {CRASH_NOUN[travelMode]} crashes only. Tap a dot for details. City
+          of San José crash data, last five years.
         </Text>
 
         <View style={styles.controls}>
@@ -1407,7 +2203,7 @@ export default function App() {
                     <View
                       style={[
                         styles.safetyDot,
-                        { backgroundColor: safetyColor(dotLevel(r, scored)) },
+                        { backgroundColor: safetyColor(routeLevel(r, scored.length)) },
                       ]}
                     />
                     <Text style={styles.routeChipText}>
@@ -1418,10 +2214,8 @@ export default function App() {
                   <Text style={styles.routeChipSub}>
                     {Math.round(r.corridorRatio * 100)}% on busy main roads
                     {r.crashCount
-                      ? ` · ${r.crashCount} injury crash${
-                          r.crashCount === 1 ? '' : 'es'
-                        } nearby${
-                          r.ksiCount ? ` (${r.ksiCount} death/severe)` : ''
+                      ? ` · ${crashCountText(r.crashCount, travelMode)} nearby${
+                          r.highRiskCount ? ` (${r.highRiskCount} high risk)` : ''
                         }`
                       : ''}
                   </Text>
@@ -1447,14 +2241,18 @@ export default function App() {
             <Pressable
               style={({ pressed }) => [
                 styles.gmapsButton,
+                styles.startButton,
                 pressed && styles.modeButtonPressed,
               ]}
-              onPress={() => openInGoogleMaps(active, GOOGLE_MODE[travelMode])}
+              onPress={() => setNavigating(true)}
             >
-              <Text style={styles.gmapsButtonText}>Open in Google Maps</Text>
+              <View style={styles.modeButtonContent}>
+                <MaterialIcons name="navigation" size={22} color="#fff" />
+                <Text style={styles.gmapsButtonText}>Start navigation</Text>
+              </View>
             </Pressable>
             <Text style={styles.gmapsHint}>
-              For voice navigation and live re-routing along this route.
+              Turn-by-turn voice directions along this exact route.
             </Text>
 
             <View style={styles.safetyBox}>
@@ -1468,7 +2266,7 @@ export default function App() {
                     <View
                       style={[
                         styles.safetyDot,
-                        { backgroundColor: safetyColor(dotLevel(active, scored)) },
+                        { backgroundColor: safetyColor(routeLevel(active, scored.length)) },
                       ]}
                     />
                     <Text style={styles.safetyText}>
@@ -1481,12 +2279,12 @@ export default function App() {
                   </View>
                   <Text style={styles.safetyText}>
                     {active.crashCount === 0
-                      ? 'No reported injury crashes along this route'
-                      : `${active.crashCount} reported injury crash${
-                          active.crashCount === 1 ? '' : 'es'
-                        } within ${formatDistance(NEAR_CRASH_M)}` +
-                        (active.ksiCount > 0
-                          ? `, ${active.ksiCount} with a death or severe injury`
+                      ? `No reported ${CRASH_NOUN[travelMode]} crashes along this route`
+                      : `${crashCountText(active.crashCount, travelMode)} within ${formatDistance(
+                          NEAR_CRASH_M,
+                        )}` +
+                        (active.highRiskCount > 0
+                          ? `, ${active.highRiskCount} high risk`
                           : '') +
                         ' (City of San José data)'}
                   </Text>
@@ -1519,8 +2317,18 @@ export default function App() {
                   No Vision Zero safety corridors along this route.
                 </Text>
               )}
+              <Text style={styles.safetyText}>
+                {driveResult.crashCount === 0
+                  ? 'No reported car crashes along this route'
+                  : `${crashCountText(driveResult.crashCount, 'drive')} within ${formatDistance(
+                      NEAR_CRASH_M,
+                    )}` +
+                    (driveResult.highRiskCount > 0
+                      ? `, ${driveResult.highRiskCount} high risk`
+                      : '')}
+              </Text>
               <Text style={styles.safetyMuted}>
-                City of San José Vision Zero data.
+                City of San José Vision Zero and crash data.
               </Text>
             </View>
 
@@ -1547,6 +2355,8 @@ export default function App() {
 
 // The status bar is translucent, so inset the top of the screen by hand.
 const TOP_INSET = Platform.OS === 'ios' ? 60 : (RNStatusBar.currentHeight ?? 24) + 12;
+// Room for the iPhone home indicator under bottom-pinned controls.
+const BOTTOM_INSET = Platform.OS === 'ios' ? 34 : 16;
 
 const styles = StyleSheet.create({
   container: {
@@ -1618,13 +2428,11 @@ const styles = StyleSheet.create({
   modeRow: {
     flexDirection: 'row',
     gap: 8,
-    marginTop: 20,
+    marginTop: 12,
   },
-  controlsAboveMap: {
-    marginBottom: 12,
-  },
-  modeRowAboveMap: {
-    marginTop: 0,
+  addressSection: {
+    paddingHorizontal: 16,
+    marginTop: 12,
   },
   modeButton: {
     flex: 1,
@@ -1655,6 +2463,17 @@ const styles = StyleSheet.create({
   },
   modeButtonTextDisabled: {
     color: '#B0B0B5',
+  },
+  findingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 12,
+  },
+  findingText: {
+    fontSize: 14,
+    fontFamily: FONT.regular,
+    color: '#636366',
   },
   spinner: {
     marginTop: 8,
@@ -1887,5 +2706,127 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: FONT.regular,
     color: '#8E8E93',
+  },
+  startButton: {
+    backgroundColor: '#007AFF',
+  },
+  navScreen: {
+    flex: 1,
+  },
+  navBanner: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+    paddingTop: TOP_INSET,
+    paddingBottom: 18,
+    paddingHorizontal: 20,
+    backgroundColor: '#0B6E4F',
+  },
+  navBannerOff: {
+    backgroundColor: '#C93400',
+  },
+  navBannerArrived: {
+    backgroundColor: '#007AFF',
+  },
+  navBannerText: {
+    flex: 1,
+  },
+  navHeadline: {
+    color: '#fff',
+    fontSize: 30,
+    lineHeight: 36,
+    fontFamily: FONT.bold,
+  },
+  navDetail: {
+    color: '#fff',
+    fontSize: 18,
+    lineHeight: 24,
+    fontFamily: FONT.semibold,
+  },
+  navBottom: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+  },
+  navRecenter: {
+    alignSelf: 'flex-start',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginLeft: 16,
+    marginBottom: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 22,
+    backgroundColor: '#fff',
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3,
+  },
+  navRecenterText: {
+    color: '#007AFF',
+    fontSize: 15,
+    fontFamily: FONT.semibold,
+  },
+  navFooter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingTop: 16,
+    paddingBottom: BOTTOM_INSET,
+    paddingHorizontal: 20,
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    backgroundColor: '#fff',
+    shadowColor: '#000',
+    shadowOpacity: 0.12,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: -2 },
+    elevation: 6,
+  },
+  navFooterText: {
+    flex: 1,
+  },
+  navEta: {
+    fontSize: 24,
+    lineHeight: 30,
+    color: '#0B6E4F',
+    fontFamily: FONT.bold,
+  },
+  navEtaSub: {
+    fontSize: 14,
+    color: '#636366',
+    fontFamily: FONT.regular,
+  },
+  navIconButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#F2F2F7',
+  },
+  navEndButton: {
+    height: 44,
+    paddingHorizontal: 22,
+    borderRadius: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FF3B30',
+  },
+  navDoneButton: {
+    backgroundColor: '#007AFF',
+  },
+  navEndText: {
+    color: '#fff',
+    fontSize: 16,
+    fontFamily: FONT.bold,
   },
 });
