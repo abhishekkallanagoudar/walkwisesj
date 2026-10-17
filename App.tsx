@@ -524,6 +524,28 @@ function stepInstruction(s: any): string {
   return `Turn ${modifier}${onto}`;
 }
 
+// The public server is shared and sometimes busy or rate-limited, so a
+// failed request is tried again after a short wait, up to `retries` times.
+// OSRM answers "no route" with HTTP 400 and a JSON body, so that's read and
+// returned; a timeout, a dropped connection, HTTP 429 or a server error is a
+// real failure.
+async function fetchOsrm(url: string, retries: number): Promise<any> {
+  for (let attempt = 0; ; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20_000);
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      if (res.status === 429 || res.status >= 500) throw new Error(`HTTP ${res.status} from OSRM`);
+      return await res.json();
+    } catch (e) {
+      if (attempt >= retries) throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
+  }
+}
+
 // Ask OSRM for one or more routes, each with per-maneuver steps, so we can
 // both rank them for safety and show turn-by-turn directions. Walk and Bike
 // ask for alternatives to rank; Drive just needs the one default route to
@@ -534,6 +556,7 @@ async function fetchRoutes(
   mode: GoogleTravelMode = 'walking',
   alternatives = true,
   via: LatLng[] = [],
+  retries = 0,
 ): Promise<Route[]> {
   const coords = [from, ...via, to].map((p) => `${p.longitude},${p.latitude}`).join(';');
   const params = new URLSearchParams({
@@ -543,19 +566,7 @@ async function fetchRoutes(
     // OSRM only offers alternatives between two points.
     alternatives: alternatives && !via.length ? 'true' : 'false',
   });
-  // OSRM answers "no route" with HTTP 400 and a JSON body, so read the body
-  // whatever the status; anything else that fails is a real error.
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20_000);
-  let json: any;
-  try {
-    const res = await fetch(`${OSRM_URL[mode]}/${coords}?${params.toString()}`, {
-      signal: controller.signal,
-    });
-    json = await res.json();
-  } finally {
-    clearTimeout(timer);
-  }
+  const json = await fetchOsrm(`${OSRM_URL[mode]}/${coords}?${params.toString()}`, retries);
   const rs = json.routes;
   if (json.code !== 'Ok' || !Array.isArray(rs) || rs.length === 0) return [];
   return rs.map((r: any) => ({
@@ -1150,6 +1161,12 @@ const SAFETY_CORRIDORS_URL =
 
 // A route point within this many metres of a corridor counts as "on" it.
 const ON_CORRIDOR_M = 25;
+// The first and last stretch of a route don't count toward busy-road or
+// crash-site overlap: a trip that starts or ends on a busy street can't
+// always avoid it, so it shouldn't mark every route there as unsafe. Busy
+// road in that stretch still adds to the risk score, so a way in from a
+// quieter side wins when there is one.
+const ENDPOINT_GRACE_M = 50;
 
 async function fetchSafetyCorridors(): Promise<Corridor[]> {
   const json = await fetchJson(SAFETY_CORRIDORS_URL);
@@ -1177,6 +1194,45 @@ async function fetchSafetyCorridors(): Promise<Corridor[]> {
   return out;
 }
 
+function onAnyCorridor(p: LatLng, corridors: Corridor[]): boolean {
+  return corridors.some(
+    (c) =>
+      bboxIntersect(c.bbox, [p.longitude, p.latitude, p.longitude, p.latitude], 0.001) &&
+      c.points.some(
+        (q, j) => j > 0 && pointToSegMeters(p, c.points[j - 1], q) <= ON_CORRIDOR_M,
+      ),
+  );
+}
+
+// OSRM ends a route on whichever path is nearest the destination, which for a
+// shop on a busy street is often that street's sidewalk, even when a parking
+// lot or footway behind it leads in from a quiet side street. These are the
+// other paths near the destination that aren't on a busy road, to route to as
+// well; scoring then picks the better way in.
+const ENTRANCE_MAX_M = 60;
+const ENTRANCE_TRIES = 2;
+
+async function quietEntrances(
+  dest: LatLng,
+  mode: GoogleTravelMode,
+  corridors: Corridor[],
+): Promise<LatLng[]> {
+  const url = OSRM_URL[mode].replace('/route/v1/', '/nearest/v1/');
+  const json = await fetchOsrm(`${url}/${dest.longitude},${dest.latitude}?number=8`, 0);
+  const out: LatLng[] = [];
+  // The first waypoint is where OSRM's own route already ends.
+  for (const w of ((json.waypoints ?? []) as any[]).slice(1)) {
+    const [lon, lat] = w.location ?? [];
+    if (typeof lat !== 'number' || typeof lon !== 'number') continue;
+    const p: LatLng = { latitude: lat, longitude: lon };
+    if (segMeters(p, dest) > ENTRANCE_MAX_M || onAnyCorridor(p, corridors)) continue;
+    if (out.some((q) => segMeters(q, p) < 15)) continue;
+    out.push(p);
+    if (out.length >= ENTRANCE_TRIES) break;
+  }
+  return out;
+}
+
 // Rate one route: metres on Vision Zero priority safety corridors, the
 // severity-weighted injury crashes alongside it (fatal 8 / severe 4 / moderate 2
 // / minor 1), and, for Walk, major-road crossings without a crosswalk. Lower
@@ -1193,15 +1249,22 @@ function scoreRoute(
   );
   const crashes = crashesNearRoute(route.points, allCrashes);
 
+  const routeLen = route.points.reduce(
+    (sum, p, i) => (i ? sum + segMeters(route.points[i - 1], p) : 0),
+    0,
+  );
   let total = 0;
   let onCorridor = 0;
+  let endCorridor = 0;
   let nearCrash = 0;
   const segOnCorridor: boolean[] = [];
   for (let i = 0; i < route.points.length - 1; i++) {
     const a = route.points[i];
     const b = route.points[i + 1];
     const segLen = segMeters(a, b);
+    const midAlong = total + segLen / 2;
     total += segLen;
+    const atEnd = midAlong < ENDPOINT_GRACE_M || midAlong > routeLen - ENDPOINT_GRACE_M;
     const mid: LatLng = {
       latitude: (a.latitude + b.latitude) / 2,
       longitude: (a.longitude + b.longitude) / 2,
@@ -1215,6 +1278,11 @@ function scoreRoute(
           break;
         }
       }
+    }
+    if (atEnd) {
+      if (near) endCorridor += segLen;
+      segOnCorridor.push(false);
+      continue;
     }
     if (near) onCorridor += segLen;
     segOnCorridor.push(near);
@@ -1251,7 +1319,10 @@ function scoreRoute(
   // along one); crashes and any fatal or severe ones separate routes whose
   // busy-road use is close.
   const riskScore =
-    onCorridor * 10 + crashWeight * 5 + highRiskCount * 25 + unsafeCrossings.length * 100;
+    (onCorridor + endCorridor) * 10 +
+    crashWeight * 5 +
+    highRiskCount * 25 +
+    unsafeCrossings.length * 100;
 
   return {
     ...route,
@@ -1275,6 +1346,14 @@ function isRouteClear(r: ScoredRoute): boolean {
   return r.corridorMeters === 0 && r.crashCount === 0 && r.unsafeCrossings.length === 0;
 }
 
+// A route counts as safe only if at most 1% of its length is near past crash
+// sites and at most 1% is on busy main roads.
+const SAFE_MAX_SHARE = 0.01;
+
+function isSafeEnough(r: ScoredRoute): boolean {
+  return r.crashShare <= SAFE_MAX_SHARE && r.corridorRatio <= SAFE_MAX_SHARE;
+}
+
 // Safest first. A route that's clear of every hazard always beats one that
 // merely scores lower on the weighted risk formula; equal risk goes to the
 // shorter route, so the order is never a tie.
@@ -1294,22 +1373,14 @@ function pickFastest(pool: ScoredRoute[]): ScoredRoute {
   return [...pool].sort((a, b) => a.meters - b.meters || compareSafety(a, b))[0];
 }
 
-// The two routes offered, always both, safest first: [safest, fastest]. When
-// one route is both, it appears twice, once in each role.
+// The routes offered, safest first: [safest, fastest]. The fastest is left
+// out when it doesn't save at least a minute as shown on the cards, since
+// then the safest route is also the fastest.
 function rankRoutes(pool: ScoredRoute[]): ScoredRoute[] {
-  return [
-    { ...pickSafest(pool), role: 'safest' },
-    { ...pickFastest(pool), role: 'fastest' },
-  ];
-}
-
-function isSameRoute(a: Route, b: Route): boolean {
-  return (
-    a.points.length === b.points.length &&
-    a.points.every(
-      (p, i) => p.latitude === b.points[i].latitude && p.longitude === b.points[i].longitude,
-    )
-  );
+  const safest: ScoredRoute = { ...pickSafest(pool), role: 'safest' };
+  const fastest: ScoredRoute = { ...pickFastest(pool), role: 'fastest' };
+  if (Math.round(fastest.seconds / 60) >= Math.round(safest.seconds / 60)) return [safest];
+  return [safest, fastest];
 }
 
 // --- Safer detours ---
@@ -1423,13 +1494,24 @@ function sameRoute(a: Route, b: Route): boolean {
 }
 
 // The two options are named for what they're for, and colored to match:
-// green for the safest route, grey for the fastest.
+// green (or a warning color) for the safest route, grey for the fastest. A safest route that isn't
+// safe enough is only safer.
 function routeName(r: ScoredRoute): string {
-  return r.role === 'safest' ? 'Safest' : 'Fastest';
+  if (r.role !== 'safest') return 'Fastest';
+  return isSafeEnough(r) ? 'Safest' : 'Safer';
 }
 
+// The safest route's dot also shows how safe it is, by the larger of its
+// shares near crash sites and on busy roads: green up to 1%, yellow up to 5%,
+// red beyond.
+const CAUTION_MAX_SHARE = 0.05;
+
 function routeColor(r: ScoredRoute, alpha = 1): string {
-  return r.role === 'safest' ? `rgba(52,199,89,${alpha})` : `rgba(142,142,147,${alpha})`;
+  if (r.role !== 'safest') return `rgba(142,142,147,${alpha})`;
+  const worst = Math.max(r.crashShare, r.corridorRatio);
+  if (worst <= SAFE_MAX_SHARE) return `rgba(52,199,89,${alpha})`;
+  if (worst <= CAUTION_MAX_SHARE) return `rgba(255,204,0,${alpha})`;
+  return `rgba(255,59,48,${alpha})`;
 }
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
@@ -1492,10 +1574,10 @@ function explainRoute(
   all: ScoredRoute[],
   mode: TravelMode,
 ): string {
-  const fastest = all.find((x) => x.role === 'fastest') ?? all[0];
+  const fastest = all.find((x) => x.role === 'fastest');
   const safest = all.find((x) => x.role === 'safest') ?? all[0];
-  if (isSameRoute(fastest, safest)) {
-    return 'Good news: the safest route is also the fastest, so both options are the same route.';
+  if (!fastest) {
+    return 'Good news: the safest route is also the fastest, so it is the only option shown.';
   }
   const other = r.role === 'safest' ? fastest : safest;
   const name = r.role === 'safest' ? 'the fastest route' : 'the safest route';
@@ -2016,6 +2098,7 @@ function RouteOptionCard({
   onPress: () => void;
 }) {
   const safest = route.role === 'safest';
+  const safeEnough = safest && isSafeEnough(route);
   const unsafe = route.unsafeCrossings.length;
   const left = remainingHazards(route).length;
   return (
@@ -2029,23 +2112,12 @@ function RouteOptionCard({
       <View style={cardStyles.optionHeader}>
         <View style={[cardStyles.roleDot, { backgroundColor: routeColor(route) }]} />
         <View style={cardStyles.optionTitleWrap}>
-          <Text style={cardStyles.optionTitle}>{routeName(route)}</Text>
-          {(safest || sameAsFastest) && (
-            <View style={cardStyles.tagRow}>
-              {safest && (
-                <View style={[cardStyles.tag, cardStyles.tagGreen]}>
-                  <MaterialIcons name="verified-user" size={12} color="#1E8E3E" />
-                  <Text style={[cardStyles.tagText, { color: '#1E8E3E' }]}>Recommended</Text>
-                </View>
-              )}
-              {safest && sameAsFastest && (
-                <View style={[cardStyles.tag, cardStyles.tagBlue]}>
-                  <MaterialIcons name="bolt" size={12} color="#0A5CE0" />
-                  <Text style={[cardStyles.tagText, { color: '#0A5CE0' }]}>Same as fastest</Text>
-                </View>
-              )}
-            </View>
-          )}
+          <Text style={cardStyles.optionTitle}>
+            {safeEnough && sameAsFastest ? 'Safest and fastest' : routeName(route)}
+            {safest && !safeEnough && (
+              <Text style={cardStyles.optionCaution}> (use caution)</Text>
+            )}
+          </Text>
         </View>
         <View style={cardStyles.optionTime}>
           <Text style={cardStyles.optionMinutes}>{formatDuration(route.seconds)}</Text>
@@ -2086,6 +2158,25 @@ function RouteOptionCard({
         </View>
       )}
     </Pressable>
+  );
+}
+
+// Shown above the options when even the safest route isn't safe enough.
+function NoSafeRouteBanner({ route }: { route: ScoredRoute }) {
+  const share = (x: number) => `${(x * 100).toFixed(x < 0.1 ? 1 : 0)}%`;
+  const over: string[] = [];
+  if (route.crashShare > SAFE_MAX_SHARE) over.push(`${share(route.crashShare)} near crash sites`);
+  if (route.corridorRatio > SAFE_MAX_SHARE) over.push(`${share(route.corridorRatio)} on busy roads`);
+  return (
+    <View style={cardStyles.noSafeBanner} accessibilityRole="alert">
+      <MaterialIcons name="warning" size={22} color="#1C1C1E" />
+      <View style={{ flex: 1 }}>
+        <Text style={cardStyles.noSafeTitle}>No safe route found</Text>
+        <Text style={cardStyles.noSafeText}>
+          Even the safer route runs {joinAnd(over)}. Take extra care.
+        </Text>
+      </View>
+    </View>
   );
 }
 
@@ -2323,27 +2414,31 @@ const cardStyles = StyleSheet.create({
     color: '#1C1C1E',
     fontFamily: FONT.bold,
   },
-  tagRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-    marginTop: 6,
-  },
-  tag: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 3,
-    paddingHorizontal: 7,
-    paddingVertical: 3,
-    borderRadius: 8,
-  },
-  tagGreen: { backgroundColor: '#E6F4EA' },
-  tagBlue: { backgroundColor: '#E8F0FE' },
-  tagText: {
-    fontSize: 11,
-    letterSpacing: 0.3,
-    textTransform: 'uppercase',
+  optionCaution: {
+    fontSize: 15,
+    color: '#7A5A00',
     fontFamily: FONT.semibold,
+  },
+  noSafeBanner: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    marginBottom: 10,
+    padding: 14,
+    borderRadius: 14,
+    backgroundColor: '#DAA520',
+  },
+  noSafeTitle: {
+    fontSize: 16,
+    color: '#1C1C1E',
+    fontFamily: FONT.bold,
+  },
+  noSafeText: {
+    marginTop: 2,
+    fontSize: 14,
+    lineHeight: 19,
+    color: '#1C1C1E',
+    fontFamily: FONT.regular,
   },
   optionTime: {
     alignItems: 'flex-end',
@@ -2599,6 +2694,9 @@ export default function App() {
   );
   // Skip the lookup that would otherwise fire right after we set the text ourselves.
   const skipNextLookup = useRef(false);
+  // The suggestion lookup in flight, so picking a place can stop it from
+  // showing suggestions again after they were cleared.
+  const lookup = useRef<AbortController | null>(null);
 
   // The address box sits below the map, where the keyboard would cover it.
   // While it's focused, the page scrolls it up to the top of the screen, and
@@ -2763,6 +2861,7 @@ export default function App() {
     // Photon requests are aborted when the text changes; the device-geocoder
     // fallback can't be, so its late answers are ignored via the same signal.
     const controller = new AbortController();
+    lookup.current = controller;
     const timer = setTimeout(async () => {
       setLoading(true);
       try {
@@ -2781,12 +2880,20 @@ export default function App() {
     };
   }, [address, coords]);
 
+  // Show a picked place in the box and close the suggestions. Setting the
+  // text to what it already is doesn't re-run the lookup effect, so only
+  // skip the next lookup when the text actually changes.
+  function showPlace(place: Suggestion) {
+    lookup.current?.abort();
+    if (place.label !== address) skipNextLookup.current = true;
+    setAddress(place.label);
+    setSuggestions([]);
+    setSelected(place);
+  }
+
   function handleSelect(item: Suggestion) {
     Keyboard.dismiss();
-    skipNextLookup.current = true;
-    setAddress(item.label);
-    setSuggestions([]);
-    setSelected(item);
+    showPlace(item);
   }
 
   // Load San Jose's priority safety corridors and city limits once. If the
@@ -2920,12 +3027,7 @@ export default function App() {
     if (selected) return selected;
     const results = await searchPlaces(query, coords);
     const dest = results[0] ?? null;
-    if (dest) {
-      skipNextLookup.current = true;
-      setAddress(dest.label);
-      setSelected(dest);
-      setSuggestions([]);
-    }
+    if (dest) showPlace(dest);
     return dest;
   }
 
@@ -2957,8 +3059,21 @@ export default function App() {
         latitude: (origin.latitude + destination.latitude) / 2,
         longitude: (origin.longitude + destination.longitude) / 2,
       };
-      const [found] = await Promise.all([
-        fetchRoutes(origin, destination, GOOGLE_MODE[travelMode]),
+      const mode = GOOGLE_MODE[travelMode];
+      const [found, viaEntrances] = await Promise.all([
+        fetchRoutes(origin, destination, mode, true, [], 2),
+        // Extra routes are a bonus, so any failure here is ignored.
+        quietEntrances(destination, mode, corridors)
+          .then((points) =>
+            Promise.all(
+              points.map((p) =>
+                fetchRoutes(origin, p, mode, false)
+                  .then((rs) => rs[0] ?? null)
+                  .catch(() => null),
+              ),
+            ),
+          )
+          .catch((): (Route | null)[] => []),
         fetchWeather(midpoint)
           .then(setWeather)
           .catch(() => setWeather(null)),
@@ -2969,7 +3084,10 @@ export default function App() {
         );
         return;
       }
-      setRoutes(found);
+      const extra = viaEntrances.filter(
+        (r): r is Route => r !== null && !found.some((f) => sameRoute(f, r)),
+      );
+      setRoutes([...found, ...extra]);
     } catch {
       Alert.alert(
         "Couldn't load directions",
@@ -3004,7 +3122,7 @@ export default function App() {
       setSuggestions([]);
       const origin = { latitude: coords.lat, longitude: coords.lon };
       const destination = { latitude: dest.latitude, longitude: dest.longitude };
-      const found = await fetchRoutes(origin, destination, 'driving', false);
+      const found = await fetchRoutes(origin, destination, 'driving', false, [], 2);
       if (!found.length) {
         Alert.alert('Could not find a driving route to that address.');
         return;
@@ -3346,6 +3464,11 @@ export default function App() {
               placeholder="Where are you going?"
               placeholderTextColor="#8E8E93"
               accessibilityLabel="Destination address"
+              // The app shows its own suggestions, so keep the phone's
+              // AutoFill from offering saved addresses on top of them.
+              autoComplete="off"
+              textContentType="none"
+              importantForAutofill="no"
               autoCorrect={false}
               autoCapitalize="words"
               returnKeyType="search"
@@ -3412,7 +3535,7 @@ export default function App() {
           {findingSafer && (
             <View style={styles.findingRow}>
               <ActivityIndicator />
-              <Text style={styles.findingText}>Looking for lower-risk streets…</Text>
+              <Text style={styles.findingText}>Looking for safe routes…</Text>
             </View>
           )}
         </View>
@@ -3421,12 +3544,15 @@ export default function App() {
           {ranksRoutes && scored.length > 0 && (
             <>
               <SectionTitle>Your options</SectionTitle>
+              {!isSafeEnough(scored[0]) && (
+                <NoSafeRouteBanner route={scored[0]} />
+              )}
               {scored.map((r, i) => (
                 <RouteOptionCard
                   key={r.role ?? i}
                   route={r}
                   selected={i === activeIdx}
-                  sameAsFastest={isSameRoute(scored[0], scored[1])}
+                  sameAsFastest={scored.length === 1}
                   crashDataFailed={crashDataFailed}
                   onPress={() => setActiveIdx(i)}
                 />
@@ -3696,7 +3822,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   modeButtonActive: {
-    backgroundColor: '#3A3A3C',
+    backgroundColor: '#1E8E3E',
   },
   modeButtonDisabled: {
     backgroundColor: '#E5E5EA',
@@ -3876,7 +4002,7 @@ const styles = StyleSheet.create({
     color: '#8E8E93',
   },
   startButton: {
-    backgroundColor: '#007AFF',
+    backgroundColor: '#1E8E3E',
   },
   navScreen: {
     flex: 1,
