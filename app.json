@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "walkwisesj",
+    "name": "SafeRoutes SJ",
     "slug": "walkwisesj",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -19,7 +19,7 @@
         "ACCESS_FINE_LOCATION"
       ],
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#1A73F0",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"

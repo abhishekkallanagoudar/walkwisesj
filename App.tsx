@@ -1,7 +1,14 @@
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
 import { MaterialIcons } from '@expo/vector-icons';
-import { useEffect, useMemo, useRef, useState, type ComponentProps } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentProps,
+  type ReactNode,
+} from 'react';
 import * as Speech from 'expo-speech';
 import { useKeepAwake } from 'expo-keep-awake';
 import {
@@ -37,7 +44,22 @@ const FONT = {
 };
 const HEADING_FONT = FONT.bold;
 
-const USER_NAME = 'User';
+// Every color drawn on the map, in one place, so the map key always matches.
+// No two kinds of thing share a color.
+const MAP_COLORS = {
+  selectedRoute: '#007AFF',
+  otherRoute: 'rgba(142,142,147,0.85)',
+  busyRoad: 'rgba(255,159,10,0.5)',
+  start: '#34C759',
+  destination: '#FF3B30',
+  // Past crashes, by the worst injury: red, orange, yellow.
+  crashSerious: '#FF3B30',
+  crashModerate: '#FF9500',
+  crashMinor: '#FFCC00',
+  // Ring around the crash whose details are open.
+  crashPicked: '#007AFF',
+  noCrosswalk: '#AF52DE',
+};
 
 type LatLng = { latitude: number; longitude: number };
 
@@ -64,6 +86,8 @@ type Route = {
   meters: number;
   seconds: number;
   steps: Step[];
+  // Points a safer detour was forced through, in order (none for OSRM's own).
+  via?: LatLng[];
 };
 
 type TravelMode = 'walk' | 'bike' | 'drive';
@@ -107,7 +131,7 @@ type Crash = {
   mode: TravelMode;
   kind: string; // e.g. "Car and pedestrian"
   // Details shown when a crash dot is tapped.
-  dateMs: number | null; // San José local time, stored as if it were UTC
+  dateMs: number | null; // San Jose local time, stored as if it were UTC
   streets: string;
   narrative: string;
   collisionType: string;
@@ -125,15 +149,14 @@ type MapRegion = {
   longitudeDelta: number;
 };
 
-type SafetyLevel = 'low' | 'medium' | 'high';
-
 // Current conditions near a route, from Open-Meteo.
 type Weather = {
   tempF: number;
   description: string;
+  isDay: boolean; // false between sunset and sunrise
 };
 
-// A route plus its safety assessment against the San José datasets.
+// A route plus its safety assessment against the San Jose datasets.
 type ScoredRoute = Route & {
   crashes: Crash[];
   corridorMeters: number;
@@ -141,17 +164,244 @@ type ScoredRoute = Route & {
   segOnCorridor: boolean[]; // per route segment, whether it runs along a corridor
   crashCount: number;
   highRiskCount: number;
-  weightedPerKm: number;
-  level: SafetyLevel;
+  // Share of the route's length (0 to 1) within reach of a past crash.
+  crashShare: number;
+  // Where the route crosses a major road without a crosswalk or signal. Only
+  // checked for Walk; crossingsChecked says whether it was.
+  unsafeCrossings: LatLng[];
+  crossingsChecked: boolean;
   riskScore: number; // lower = safer
-  rank: number; // 0 = safest of the alternatives
+  // Which of the two offered routes this is. They can be the same route.
+  role: 'fastest' | 'safest' | null;
 };
+
+// Every data source is a free public server, so any of them can be slow or
+// down. Requests give up after a while instead of leaving a spinner forever,
+// and an error page from the server counts as a failure, not as "no data".
+const TIMEOUT_MS = 15_000;
+
+async function fetchJson(url: string, signal?: AbortSignal): Promise<any> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const onAbort = () => controller.abort();
+  signal?.addEventListener('abort', onAbort);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
+    const json = await res.json();
+    // ArcGIS reports query errors as a 200 with an "error" object.
+    if (json && typeof json === 'object' && 'error' in json && !('features' in json)) {
+      throw new Error(`Server error from ${url}`);
+    }
+    return json;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+// US units: feet for short distances, miles (one decimal) beyond ~0.1 mi.
+function formatDistance(m: number): string {
+  const miles = m / 1609.344;
+  return miles < 0.1
+    ? `${Math.round((m * 3.28084) / 10) * 10} ft`
+    : `${miles.toFixed(1)} mi`;
+}
+
+function formatDuration(s: number): string {
+  const min = Math.max(1, Math.round(s / 60));
+  if (min < 60) return `${min} min`;
+  return `${Math.floor(min / 60)} h ${min % 60} min`;
+}
+
+// The dataset stores street names in capitals ("SANTA CLARA ST").
+function titleCase(s: string): string {
+  return s.toLowerCase().replace(/\b[a-z]/g, (ch) => ch.toUpperCase());
+}
+
+function formatCrashDate(ms: number): string {
+  // The timestamp already holds local time, so format it as UTC to avoid
+  // shifting it by the phone's own time zone.
+  return new Date(ms).toLocaleString('en-US', {
+    timeZone: 'UTC',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
+// "300 ft" reads aloud as "300 feet"; same for miles.
+function spokenDistance(m: number): string {
+  return formatDistance(m).replace(' ft', ' feet').replace(' mi', ' miles');
+}
+
+function lowerFirst(s: string): string {
+  return s.charAt(0).toLowerCase() + s.slice(1);
+}
+
+// Local metre-per-degree scale around San Jose, good enough for city distances.
+const M_PER_DEG_LAT = 110540;
+const M_PER_DEG_LON = 111320 * Math.cos((37.3 * Math.PI) / 180);
+
+function toXY(p: LatLng): { x: number; y: number } {
+  return { x: p.longitude * M_PER_DEG_LON, y: p.latitude * M_PER_DEG_LAT };
+}
+
+function segMeters(a: LatLng, b: LatLng): number {
+  const A = toXY(a);
+  const B = toXY(b);
+  return Math.hypot(B.x - A.x, B.y - A.y);
+}
+
+function pointToSegMeters(p: LatLng, a: LatLng, b: LatLng): number {
+  const P = toXY(p);
+  const A = toXY(a);
+  const B = toXY(b);
+  const dx = B.x - A.x;
+  const dy = B.y - A.y;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 === 0 ? 0 : ((P.x - A.x) * dx + (P.y - A.y) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(P.x - (A.x + t * dx), P.y - (A.y + t * dy));
+}
+
+function bboxOf(pts: LatLng[]): BBox {
+  let minLon = Infinity;
+  let minLat = Infinity;
+  let maxLon = -Infinity;
+  let maxLat = -Infinity;
+  for (const p of pts) {
+    minLon = Math.min(minLon, p.longitude);
+    maxLon = Math.max(maxLon, p.longitude);
+    minLat = Math.min(minLat, p.latitude);
+    maxLat = Math.max(maxLat, p.latitude);
+  }
+  return [minLon, minLat, maxLon, maxLat];
+}
+
+function bboxIntersect(a: BBox, b: BBox, pad = 0): boolean {
+  return (
+    a[0] - pad <= b[2] &&
+    a[2] + pad >= b[0] &&
+    a[1] - pad <= b[3] &&
+    a[3] + pad >= b[1]
+  );
+}
+
+function padBBox(b: BBox, deg: number): BBox {
+  return [b[0] - deg, b[1] - deg, b[2] + deg, b[3] + deg];
+}
+
+// A map region that frames a whole route with a little breathing room.
+function regionForRoute(pts: LatLng[]): MapRegion {
+  const [minLon, minLat, maxLon, maxLat] = bboxOf(pts);
+  return {
+    latitude: (minLat + maxLat) / 2,
+    longitude: (minLon + maxLon) / 2,
+    latitudeDelta: Math.max(0.01, (maxLat - minLat) * 1.5),
+    longitudeDelta: Math.max(0.01, (maxLon - minLon) * 1.5),
+  };
+}
+
+function fromXY(x: number, y: number): LatLng {
+  return { latitude: y / M_PER_DEG_LAT, longitude: x / M_PER_DEG_LON };
+}
+
+function nearestSeg(p: LatLng, pts: LatLng[]): number {
+  let best = 0;
+  let bestM = Infinity;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const m = pointToSegMeters(p, pts[i], pts[i + 1]);
+    if (m < bestM) {
+      bestM = m;
+      best = i;
+    }
+  }
+  return best;
+}
+
+// Where the map starts if the device location isn't available: downtown San Jose.
+const DEFAULT_REGION: MapRegion = {
+  latitude: 37.3382,
+  longitude: -121.8863,
+  latitudeDelta: 0.03,
+  longitudeDelta: 0.03,
+};
+
+function bboxOfRegion(r: MapRegion): BBox {
+  return [
+    r.longitude - r.longitudeDelta / 2,
+    r.latitude - r.latitudeDelta / 2,
+    r.longitude + r.longitudeDelta / 2,
+    r.latitude + r.latitudeDelta / 2,
+  ];
+}
+
+// Running distance along the route to each point, in segMeters' local scale.
+function cumulativeMeters(pts: LatLng[]): number[] {
+  const out = [0];
+  for (let i = 1; i < pts.length; i++) {
+    out.push(out[i - 1] + segMeters(pts[i - 1], pts[i]));
+  }
+  return out;
+}
+
+type RouteSnap = {
+  at: LatLng; // closest point on the route
+  along: number; // metres along the route to `at`
+  off: number; // metres from the user to `at`
+  seg: number; // index of the segment `at` lies on
+};
+
+// Closest point to p on route segments [from, to).
+function snapToRoute(
+  p: LatLng,
+  pts: LatLng[],
+  cum: number[],
+  from: number,
+  to: number,
+): RouteSnap {
+  const P = toXY(p);
+  let best: RouteSnap = { at: pts[0], along: 0, off: Infinity, seg: 0 };
+  const end = Math.min(pts.length - 1, to);
+  for (let i = Math.max(0, from); i < end; i++) {
+    const A = toXY(pts[i]);
+    const B = toXY(pts[i + 1]);
+    const dx = B.x - A.x;
+    const dy = B.y - A.y;
+    const len2 = dx * dx + dy * dy;
+    let t = len2 === 0 ? 0 : ((P.x - A.x) * dx + (P.y - A.y) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const off = Math.hypot(P.x - (A.x + t * dx), P.y - (A.y + t * dy));
+    if (off < best.off) {
+      best = {
+        at: {
+          latitude: pts[i].latitude + t * (pts[i + 1].latitude - pts[i].latitude),
+          longitude: pts[i].longitude + t * (pts[i + 1].longitude - pts[i].longitude),
+        },
+        along: cum[i] + t * Math.sqrt(len2),
+        off,
+        seg: i,
+      };
+    }
+  }
+  return best;
+}
+
+// Compass bearing from a to b, in degrees clockwise from north.
+function bearingDeg(a: LatLng, b: LatLng): number {
+  const A = toXY(a);
+  const B = toXY(b);
+  return ((Math.atan2(B.x - A.x, B.y - A.y) * 180) / Math.PI + 360) % 360;
+}
 
 // Search is keyless: Photon (komoot's free OpenStreetMap search, built for
 // search-as-you-type) first, then the phone's own geocoder if Photon is down
 // or finds nothing.
 const PHOTON_URL = 'https://photon.komoot.io/api/';
-// Santa Clara County, roughly. The safety data only covers San José, so
+// Santa Clara County, roughly. The safety data only covers San Jose, so
 // results from farther away aren't useful.
 const SEARCH_BBOX: BBox = [-122.21, 36.89, -121.2, 37.49];
 
@@ -179,8 +429,7 @@ async function searchPhoton(
     limit: '10',
     lang: 'en',
   });
-  const res = await fetch(`${PHOTON_URL}?${params.toString()}`, { signal });
-  const json = await res.json();
+  const json = await fetchJson(`${PHOTON_URL}?${params.toString()}`, signal);
   const places: Suggestion[] = [];
   for (const f of json.features ?? []) {
     const c = f.geometry?.coordinates;
@@ -294,8 +543,19 @@ async function fetchRoutes(
     // OSRM only offers alternatives between two points.
     alternatives: alternatives && !via.length ? 'true' : 'false',
   });
-  const res = await fetch(`${OSRM_URL[mode]}/${coords}?${params.toString()}`);
-  const json = await res.json();
+  // OSRM answers "no route" with HTTP 400 and a JSON body, so read the body
+  // whatever the status; anything else that fails is a real error.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20_000);
+  let json: any;
+  try {
+    const res = await fetch(`${OSRM_URL[mode]}/${coords}?${params.toString()}`, {
+      signal: controller.signal,
+    });
+    json = await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
   const rs = json.routes;
   if (json.code !== 'Ok' || !Array.isArray(rs) || rs.length === 0) return [];
   return rs.map((r: any) => ({
@@ -327,36 +587,109 @@ async function fetchRoutes(
   }));
 }
 
-// US units: feet for short distances, miles (one decimal) beyond ~0.1 mi.
-function formatDistance(m: number): string {
-  const miles = m / 1609.344;
-  return miles < 0.1
-    ? `${Math.round((m * 3.28084) / 10) * 10} ft`
-    : `${miles.toFixed(1)} mi`;
+function googleMapsUrl(route: Route, mode: GoogleTravelMode = 'walking'): string {
+  const pts = route.points;
+  const at = (p: LatLng) => `${p.latitude},${p.longitude}`;
+  const params = new URLSearchParams({
+    api: '1',
+    origin: at(pts[0]),
+    destination: at(pts[pts.length - 1]),
+    travelmode: mode,
+  });
+  // Only Drive hands off to Google Maps, and it uses Google's own default
+  // route. Walk and Bike navigate in-app instead (NavigationView), since
+  // Google can only follow a custom path by turning it into stops.
+  return `https://www.google.com/maps/dir/?${params.toString()}`;
 }
 
-function formatDuration(s: number): string {
-  const min = Math.max(1, Math.round(s / 60));
-  if (min < 60) return `${min} min`;
-  return `${Math.floor(min / 60)} h ${min % 60} min`;
+function openInGoogleMaps(route: Route, mode: GoogleTravelMode = 'walking') {
+  Linking.openURL(googleMapsUrl(route, mode)).catch(() =>
+    Alert.alert('Could not open Google Maps on this device.'),
+  );
 }
 
-// --- San José Vision Zero priority safety corridors (high-injury streets) ---
-
-const SAFETY_CORRIDORS_URL =
+// San Jose only records crashes inside its own city limits, so a street just
+// over the line in Santa Clara or an unincorporated county pocket shows no
+// crashes whatever its real history. The ten City Council districts together
+// cover exactly the city, so they tell us which parts of a route the data
+// actually covers. Simplified to ~30 m, about 50 KB.
+const CITY_DISTRICTS_URL =
   'https://geo.sanjoseca.gov/server/rest/services/OPN/OPN_OpenDataService' +
-  '/MapServer/514/query?where=1%3D1&outFields=SAFETYPRIORITYSTREET&outSR=4326&f=geojson';
+  '/MapServer/120/query?where=1%3D1&outFields=DISTRICT&outSR=4326' +
+  '&maxAllowableOffset=0.0003&geometryPrecision=5&f=geojson';
 
-// Local metre-per-degree scale around San José, good enough for city distances.
-const M_PER_DEG_LAT = 110540;
-const M_PER_DEG_LON = 111320 * Math.cos((37.3 * Math.PI) / 180);
-// A route point within this many metres of a corridor counts as "on" it.
-const ON_CORRIDOR_M = 25;
+// One polygon: its outer ring then any holes, as [lon, lat] pairs.
+type CityPolygon = number[][][];
+
+async function fetchCityLimits(): Promise<CityPolygon[]> {
+  const json = await fetchJson(CITY_DISTRICTS_URL);
+  const out: CityPolygon[] = [];
+  for (const f of json.features ?? []) {
+    const g = f.geometry;
+    if (g?.type === 'Polygon') out.push(g.coordinates);
+    else if (g?.type === 'MultiPolygon') out.push(...g.coordinates);
+  }
+  return out;
+}
+
+// Even-odd ray casting over every ring, so holes count as outside.
+function inPolygon(p: LatLng, poly: CityPolygon): boolean {
+  const x = p.longitude;
+  const y = p.latitude;
+  let inside = false;
+  for (const ring of poly) {
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const [xi, yi] = ring[i];
+      const [xj, yj] = ring[j];
+      if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) {
+        inside = !inside;
+      }
+    }
+  }
+  return inside;
+}
+
+function inCity(p: LatLng, city: CityPolygon[]): boolean {
+  return city.some((poly) => inPolygon(p, poly));
+}
+
+// Share of a route's length (0 to 1) that lies inside the city, judged by
+// each segment's midpoint.
+function cityShare(pts: LatLng[], city: CityPolygon[]): number {
+  let total = 0;
+  let inside = 0;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const len = segMeters(pts[i], pts[i + 1]);
+    const mid = {
+      latitude: (pts[i].latitude + pts[i + 1].latitude) / 2,
+      longitude: (pts[i].longitude + pts[i + 1].longitude) / 2,
+    };
+    total += len;
+    if (inCity(mid, city)) inside += len;
+  }
+  return total > 0 ? inside / total : 1;
+}
+
+// County expressways (Lawrence, Capitol, Almaden, San Tomas…) run through the
+// city but are run by Santa Clara County, so their crashes aren't in the
+// city's records either. They're found by name in the route's directions.
+function countyExpressways(route: Route): { names: string[]; meters: number } {
+  const names = new Set<string>();
+  let meters = 0;
+  for (const s of route.steps) {
+    const m = s.instruction.match(/(?:onto|on) (.*\b(?:Expressway|Expwy)\b.*)$/i);
+    if (!m) continue;
+    names.add(m[1]);
+    meters += s.meters;
+  }
+  return { names: [...names], meters };
+}
+
 // A crash within this many metres of the route counts as "along" it.
 const NEAR_CRASH_M = 40;
 
 // "Crash Locations Last Five Years" — every reported injury crash, not just the
-// killed-or-severely-injured ones. NOTE: San José only logs crashes inside its
+// killed-or-severely-injured ones. NOTE: San Jose only logs crashes inside its
 // own city limits, so county expressways (e.g. Lawrence Expwy) and neighbouring
 // cities have little or no data here regardless of their real crash history.
 const CRASH_WHERE =
@@ -418,98 +751,6 @@ function crashesUrl(box: BBox, limit: number, mode: TravelMode): string {
     '&orderByFields=CRASHDATETIME%20DESC' +
     `&resultRecordCount=${limit}&returnGeometry=true&f=geojson`
   );
-}
-
-// The dataset stores street names in capitals ("SANTA CLARA ST").
-function titleCase(s: string): string {
-  return s.toLowerCase().replace(/\b[a-z]/g, (ch) => ch.toUpperCase());
-}
-
-function toXY(p: LatLng): { x: number; y: number } {
-  return { x: p.longitude * M_PER_DEG_LON, y: p.latitude * M_PER_DEG_LAT };
-}
-
-function segMeters(a: LatLng, b: LatLng): number {
-  const A = toXY(a);
-  const B = toXY(b);
-  return Math.hypot(B.x - A.x, B.y - A.y);
-}
-
-function pointToSegMeters(p: LatLng, a: LatLng, b: LatLng): number {
-  const P = toXY(p);
-  const A = toXY(a);
-  const B = toXY(b);
-  const dx = B.x - A.x;
-  const dy = B.y - A.y;
-  const len2 = dx * dx + dy * dy;
-  let t = len2 === 0 ? 0 : ((P.x - A.x) * dx + (P.y - A.y) * dy) / len2;
-  t = Math.max(0, Math.min(1, t));
-  return Math.hypot(P.x - (A.x + t * dx), P.y - (A.y + t * dy));
-}
-
-function bboxOf(pts: LatLng[]): BBox {
-  let minLon = Infinity;
-  let minLat = Infinity;
-  let maxLon = -Infinity;
-  let maxLat = -Infinity;
-  for (const p of pts) {
-    minLon = Math.min(minLon, p.longitude);
-    maxLon = Math.max(maxLon, p.longitude);
-    minLat = Math.min(minLat, p.latitude);
-    maxLat = Math.max(maxLat, p.latitude);
-  }
-  return [minLon, minLat, maxLon, maxLat];
-}
-
-function bboxIntersect(a: BBox, b: BBox, pad = 0): boolean {
-  return (
-    a[0] - pad <= b[2] &&
-    a[2] + pad >= b[0] &&
-    a[1] - pad <= b[3] &&
-    a[3] + pad >= b[1]
-  );
-}
-
-function padBBox(b: BBox, deg: number): BBox {
-  return [b[0] - deg, b[1] - deg, b[2] + deg, b[3] + deg];
-}
-
-// A map region that frames a whole route with a little breathing room.
-function regionForRoute(pts: LatLng[]): MapRegion {
-  const [minLon, minLat, maxLon, maxLat] = bboxOf(pts);
-  return {
-    latitude: (minLat + maxLat) / 2,
-    longitude: (minLon + maxLon) / 2,
-    latitudeDelta: Math.max(0.01, (maxLat - minLat) * 1.5),
-    longitudeDelta: Math.max(0.01, (maxLon - minLon) * 1.5),
-  };
-}
-
-async function fetchSafetyCorridors(): Promise<Corridor[]> {
-  const res = await fetch(SAFETY_CORRIDORS_URL);
-  const json = await res.json();
-  const out: Corridor[] = [];
-  for (const f of json.features ?? []) {
-    const g = f.geometry;
-    if (!g) continue;
-    const lines: number[][][] =
-      g.type === 'LineString'
-        ? [g.coordinates]
-        : g.type === 'MultiLineString'
-          ? g.coordinates
-          : [];
-    for (const line of lines) {
-      const points: LatLng[] = line
-        .filter((c) => Array.isArray(c) && c.length >= 2)
-        .map(([lon, lat]) => ({ latitude: lat, longitude: lon }));
-      if (points.length < 2) continue;
-      out.push({
-        points,
-        bbox: bboxOf(points),
-      });
-    }
-  }
-  return out;
 }
 
 // Which travel mode a crash belongs to, from the parties involved
@@ -574,10 +815,54 @@ function crashKind(p: any, mode: TravelMode): string {
   return DRIVE_HIT[involved] ?? 'Car crash';
 }
 
-// Narratives end with the outcome ("... pedestrian with fatality", "with
-// serious injuries"). The app only shows a risk level, so drop that part.
-function stripOutcome(narrative: string): string {
-  return narrative.replace(/\s+with\s+(fatalit|serious injur)[\s\S]*$/i, '').trim();
+// One party from a police narrative ("33 year-old male drugged pedestrian"),
+// reduced to just its role ("pedestrian"). Ages, genders and impairment are
+// left out so the card stays factual without being blunt about real people.
+function crashParty(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/\b(\d+|unspecified) year-old\b/g, '')
+    .replace(/\b(unspecified|male|female|drunk|tipsy|drugged|fatigued|impaired|hit-and-run)\b/g, '')
+    .replace(/\brider in an? (\w+)/, '$1 rider')
+    .replace(/^\s*in an?\b/, ' ')
+    .replace(/\bemergency driver\b/, 'emergency vehicle driver')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function withArticle(party: string): string {
+  if (/^\d/.test(party)) return party; // "2 parked cars"
+  return `${/^[aeiou]/.test(party) ? 'an' : 'a'} ${party}`;
+}
+
+function listParties(parties: string[]): string {
+  return parties.length > 1
+    ? `${parties.slice(0, -1).join(', ')} and ${parties[parties.length - 1]}`
+    : parties[0];
+}
+
+// Turns "32 year-old male drunk truck driver vs 35 year-old female pedestrian
+// vs 44 year-old male pedestrian with fatality" into "A truck driver collided
+// with 2 pedestrians." The outcome is dropped too; the app only shows a risk
+// level.
+function gentleNarrative(narrative: string): string {
+  const parties = narrative
+    .replace(/\s+with\s+(fatalit|serious injur)[\s\S]*$/i, '')
+    .split(/\s+vs\.?\s+/i)
+    .map(crashParty)
+    .filter(Boolean);
+  if (!parties.length) return '';
+  // Group repeats: three "pedestrian" parties become "3 pedestrians".
+  const counts = new Map<string, number>();
+  for (const p of parties.slice(1)) counts.set(p, (counts.get(p) ?? 0) + 1);
+  const others = [...counts].map(([p, n]) =>
+    n > 1 ? `${n} ${p.replace(/y$/, 'ie')}s` : withArticle(p),
+  );
+  const first = withArticle(parties[0]);
+  const sentence = others.length
+    ? `${first} collided with ${listParties(others)}.`
+    : `Involved ${first}.`;
+  return sentence[0].toUpperCase() + sentence.slice(1);
 }
 
 async function fetchCrashes(
@@ -586,8 +871,7 @@ async function fetchCrashes(
   limit = 2000,
   signal?: AbortSignal,
 ): Promise<Crash[]> {
-  const res = await fetch(crashesUrl(box, limit, mode), { signal });
-  const json = await res.json();
+  const json = await fetchJson(crashesUrl(box, limit, mode), signal);
   const out: Crash[] = [];
   for (const f of json.features ?? []) {
     const c = f.geometry?.coordinates;
@@ -618,7 +902,7 @@ async function fetchCrashes(
         .filter(Boolean)
         .map(titleCase)
         .join(' & '),
-      narrative: stripOutcome(p.NARRATIVE ?? ''),
+      narrative: gentleNarrative(p.NARRATIVE ?? ''),
       collisionType: p.COLLISIONTYPE ?? '',
       involvedWith: p.VEHICLEINVOLVEDWITH ?? '',
       lighting: p.LIGHTING ?? '',
@@ -631,16 +915,15 @@ async function fetchCrashes(
 }
 
 // Whether the city has any injury crashes on record in this box, of any kind.
-// None at all means the area is outside San José's data, not that it's safe.
+// None at all means the area is outside San Jose's data, not that it's safe.
 async function hasAnyCrashes(box: BBox): Promise<boolean> {
-  const res = await fetch(
+  const json = await fetchJson(
     'https://geo.sanjoseca.gov/server/rest/services/OPN/OPN_OpenDataService' +
       '/MapServer/553/query?where=' +
       encodeURIComponent(CRASH_WHERE) +
       `&geometry=${box.join(',')}` +
       '&geometryType=esriGeometryEnvelope&inSR=4326&returnCountOnly=true&f=json',
   );
-  const json = await res.json();
   return Number(json.count ?? 0) > 0;
 }
 
@@ -655,21 +938,264 @@ function crashesNearRoute(routePts: LatLng[], all: Crash[]): Crash[] {
   });
 }
 
-// Rate one route: metres on Vision Zero priority safety corridors, plus the
+// Crash dots only load once the map is zoomed in at least this far, so a
+// city-wide view doesn't try to draw thousands of markers.
+const MAX_CRASH_DELTA = 0.06;
+const MAP_CRASH_LIMIT = 500;
+
+// Crashes are shown by the worst injury: fatal or serious (red), moderate
+// (orange) or minor (yellow). The map key lists these same three.
+const CRASH_SEVERITY_KEY = [
+  { label: 'Fatal or serious injury', color: MAP_COLORS.crashSerious },
+  { label: 'Moderate injury', color: MAP_COLORS.crashModerate },
+  { label: 'Minor injury', color: MAP_COLORS.crashMinor },
+];
+
+function severityIndex(c: Crash): number {
+  return c.highRisk ? 0 : c.severity === 'moderate' ? 1 : 2;
+}
+
+function crashColor(c: Crash): string {
+  return CRASH_SEVERITY_KEY[severityIndex(c)].color;
+}
+
+// e.g. "Fatal or serious injury · Car and pedestrian"
+function crashTitle(c: Crash): string {
+  return `${CRASH_SEVERITY_KEY[severityIndex(c)].label} · ${c.kind}`;
+}
+
+// What to call a mode's crashes in route summaries.
+const CRASH_NOUN: Record<TravelMode, string> = {
+  walk: 'pedestrian',
+  bike: 'bike',
+  drive: 'car',
+};
+
+// --- Crossing busy roads only at crosswalks (Walk) ---
+//
+// Major roads (tertiary and up) and pedestrian crossings (marked crosswalks
+// and traffic signals) come from OpenStreetMap, bundled with the app in
+// data/crossings.json. A route "crosses" a major road where it goes
+// from one side of the road to the other; that crossing is safe if a
+// crosswalk or signal is close by. Quiet residential streets aren't checked:
+// every intersection there is a legal crosswalk, and most aren't painted.
+
+type CrossingData = {
+  roads: number[][]; // each road as flat [lon, lat, lon, lat, ...]
+  crossings: number[]; // flat [lon, lat, lon, lat, ...]
+};
+
+type XY = { x: number; y: number };
+
+type CrossingIndex = {
+  segs: Map<string, [XY, XY][]>; // road segments by grid cell
+  points: Map<string, XY[]>; // crossings by grid cell
+};
+
+// A crosswalk or signal within this distance of where the route crosses the
+// road counts (signal nodes sit in the middle of an intersection, about this
+// far from the painted crosswalks).
+const CROSSWALK_NEAR_M = 25;
+// How far along the route to look on each side of the road.
+const SIDE_LOOK_M = 20;
+// Ignore points this close to the road line when deciding which side they're on.
+const SIDE_MIN_M = 3;
+// Crossings closer together than this are one crossing.
+const SAME_CROSSING_M = 30;
+const CELL_M = 100;
+
+const cellOf = (p: XY) => `${Math.floor(p.x / CELL_M)},${Math.floor(p.y / CELL_M)}`;
+
+function add<T>(map: Map<string, T[]>, key: string, v: T) {
+  const list = map.get(key);
+  if (list) list.push(v);
+  else map.set(key, [v]);
+}
+
+// Cells a box from a to b (plus a margin) touches.
+function cellsAround(a: XY, b: XY, marginM: number): string[] {
+  const out: string[] = [];
+  const x0 = Math.floor((Math.min(a.x, b.x) - marginM) / CELL_M);
+  const x1 = Math.floor((Math.max(a.x, b.x) + marginM) / CELL_M);
+  const y0 = Math.floor((Math.min(a.y, b.y) - marginM) / CELL_M);
+  const y1 = Math.floor((Math.max(a.y, b.y) + marginM) / CELL_M);
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) out.push(`${x},${y}`);
+  return out;
+}
+
+function buildCrossingIndex(data: CrossingData): CrossingIndex {
+  const segs = new Map<string, [XY, XY][]>();
+  const points = new Map<string, XY[]>();
+  for (const road of data.roads) {
+    for (let i = 0; i + 3 < road.length; i += 2) {
+      const a = toXY({ longitude: road[i], latitude: road[i + 1] });
+      const b = toXY({ longitude: road[i + 2], latitude: road[i + 3] });
+      const seg: [XY, XY] = [a, b];
+      for (const cell of cellsAround(a, b, 0)) add(segs, cell, seg);
+    }
+  }
+  for (let i = 0; i + 1 < data.crossings.length; i += 2) {
+    const p = toXY({ longitude: data.crossings[i], latitude: data.crossings[i + 1] });
+    add(points, cellOf(p), p);
+  }
+  return { segs, points };
+}
+
+let bundled: CrossingIndex | null | undefined;
+
+// The San Jose data shipped with the app, indexed on first use. Null if the
+// bundled file has no data, so crossings show as not checked rather than
+// all clear.
+function bundledCrossingIndex(): CrossingIndex | null {
+  if (bundled === undefined) {
+    const data: CrossingData = require('./assets/crossings.json');
+    bundled = data.roads.length ? buildCrossingIndex(data) : null;
+  }
+  return bundled;
+}
+
+const cross = (a: XY, b: XY) => a.x * b.y - a.y * b.x;
+const sub = (a: XY, b: XY) => ({ x: a.x - b.x, y: a.y - b.y });
+
+function nearestCrossing(p: XY, index: CrossingIndex, maxM: number): XY | null {
+  let best: XY | null = null;
+  let bestM = maxM;
+  for (const cell of cellsAround(p, p, maxM)) {
+    for (const q of index.points.get(cell) ?? []) {
+      const m = Math.hypot(q.x - p.x, q.y - p.y);
+      if (m <= bestM) {
+        bestM = m;
+        best = q;
+      }
+    }
+  }
+  return best;
+}
+
+type RoadCrossing = { at: LatLng; hasCrosswalk: boolean };
+
+// Every place the route crosses a major road, and whether there's a crosswalk.
+function findCrossings(pts: LatLng[], index: CrossingIndex): RoadCrossing[] {
+  const xy = pts.map(toXY);
+  const cum = cumulativeMeters(pts);
+  const total = cum[cum.length - 1] ?? 0;
+
+  // Position along the route at a given distance from the start.
+  let seg = 0;
+  const at = (along: number): XY => {
+    const d = Math.max(0, Math.min(total, along));
+    while (seg > 0 && cum[seg] > d) seg--;
+    while (seg < xy.length - 2 && cum[seg + 1] < d) seg++;
+    const len = cum[seg + 1] - cum[seg];
+    const t = len > 0 ? (d - cum[seg]) / len : 0;
+    return {
+      x: xy[seg].x + t * (xy[seg + 1].x - xy[seg].x),
+      y: xy[seg].y + t * (xy[seg + 1].y - xy[seg].y),
+    };
+  };
+
+  const found: XY[] = [];
+  const out: RoadCrossing[] = [];
+  for (let i = 0; i < xy.length - 1; i++) {
+    const A = xy[i];
+    const r = sub(xy[i + 1], A);
+    const seen = new Set<[XY, XY]>();
+    for (const cell of cellsAround(A, xy[i + 1], 0)) {
+      for (const road of index.segs.get(cell) ?? []) {
+        if (seen.has(road)) continue;
+        seen.add(road);
+        const [C, D] = road;
+        const s = sub(D, C);
+        const denom = cross(r, s);
+        if (Math.abs(denom) < 1e-9) continue; // parallel
+        const CA = sub(C, A);
+        const t = cross(CA, s) / denom;
+        const u = cross(CA, r) / denom;
+        if (t < 0 || t > 1 || u < 0 || u > 1) continue;
+        const P = { x: A.x + t * r.x, y: A.y + t * r.y };
+        if (found.some((f) => Math.hypot(f.x - P.x, f.y - P.y) < SAME_CROSSING_M)) continue;
+        // Only a real crossing if the route is on opposite sides of the road
+        // a little before and after; walking along it or just touching it
+        // at a corner isn't one.
+        const along = cum[i] + t * Math.hypot(r.x, r.y);
+        const sLen = Math.hypot(s.x, s.y);
+        const before = cross(s, sub(at(along - SIDE_LOOK_M), C)) / sLen;
+        const after = cross(s, sub(at(along + SIDE_LOOK_M), C)) / sLen;
+        if (before * after >= 0 || Math.abs(before) < SIDE_MIN_M || Math.abs(after) < SIDE_MIN_M) {
+          continue;
+        }
+        found.push(P);
+        out.push({
+          at: fromXY(P.x, P.y),
+          hasCrosswalk: nearestCrossing(P, index, CROSSWALK_NEAR_M) !== null,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+// The closest crosswalk or signal to an unsafe crossing, to route through
+// instead. Null if there's none within reach.
+function crosswalkNear(p: LatLng, index: CrossingIndex, maxM = 300): LatLng | null {
+  const q = nearestCrossing(toXY(p), index, maxM);
+  return q ? fromXY(q.x, q.y) : null;
+}
+
+// --- San Jose Vision Zero priority safety corridors (high-injury streets) ---
+
+const SAFETY_CORRIDORS_URL =
+  'https://geo.sanjoseca.gov/server/rest/services/OPN/OPN_OpenDataService' +
+  '/MapServer/514/query?where=1%3D1&outFields=SAFETYPRIORITYSTREET&outSR=4326&f=geojson';
+
+// A route point within this many metres of a corridor counts as "on" it.
+const ON_CORRIDOR_M = 25;
+
+async function fetchSafetyCorridors(): Promise<Corridor[]> {
+  const json = await fetchJson(SAFETY_CORRIDORS_URL);
+  const out: Corridor[] = [];
+  for (const f of json.features ?? []) {
+    const g = f.geometry;
+    if (!g) continue;
+    const lines: number[][][] =
+      g.type === 'LineString'
+        ? [g.coordinates]
+        : g.type === 'MultiLineString'
+          ? g.coordinates
+          : [];
+    for (const line of lines) {
+      const points: LatLng[] = line
+        .filter((c) => Array.isArray(c) && c.length >= 2)
+        .map(([lon, lat]) => ({ latitude: lat, longitude: lon }));
+      if (points.length < 2) continue;
+      out.push({
+        points,
+        bbox: bboxOf(points),
+      });
+    }
+  }
+  return out;
+}
+
+// Rate one route: metres on Vision Zero priority safety corridors, the
 // severity-weighted injury crashes alongside it (fatal 8 / severe 4 / moderate 2
-// / minor 1). Lower riskScore = safer / calmer.
+// / minor 1), and, for Walk, major-road crossings without a crosswalk. Lower
+// riskScore = safer.
 function scoreRoute(
   route: Route,
   corridors: Corridor[],
   allCrashes: Crash[],
+  crossings: CrossingIndex | null = null,
 ): ScoredRoute {
   const box = bboxOf(route.points);
   const nearCorridors = corridors.filter((c) =>
     bboxIntersect(c.bbox, box, 0.003),
   );
+  const crashes = crashesNearRoute(route.points, allCrashes);
 
   let total = 0;
   let onCorridor = 0;
+  let nearCrash = 0;
   const segOnCorridor: boolean[] = [];
   for (let i = 0; i < route.points.length - 1; i++) {
     const a = route.points[i];
@@ -692,28 +1218,40 @@ function scoreRoute(
     }
     if (near) onCorridor += segLen;
     segOnCorridor.push(near);
+    // Crash overlap is measured in 10 m pieces, so one long straight segment
+    // past a single crash doesn't count in full.
+    if (crashes.some((c) => pointToSegMeters(c.at, a, b) <= NEAR_CRASH_M)) {
+      const pieces = Math.max(1, Math.ceil(segLen / 10));
+      for (let k = 0; k < pieces; k++) {
+        const t = (k + 0.5) / pieces;
+        const p = {
+          latitude: a.latitude + t * (b.latitude - a.latitude),
+          longitude: a.longitude + t * (b.longitude - a.longitude),
+        };
+        if (crashes.some((c) => segMeters(c.at, p) <= NEAR_CRASH_M)) nearCrash += segLen / pieces;
+      }
+    }
   }
 
   const corridorRatio = total > 0 ? onCorridor / total : 0;
-  const crashes = crashesNearRoute(route.points, allCrashes);
-  const km = total / 1000;
+  const crashShare = total > 0 ? nearCrash / total : 0;
   const crashCount = crashes.length;
   const highRiskCount = crashes.filter((c) => c.highRisk).length;
   const crashWeight = crashes.reduce((sum, c) => sum + c.weight, 0);
-  const weightedPerKm = km > 0 ? crashWeight / km : 0;
+  const unsafeCrossings = crossings
+    ? findCrossings(route.points, crossings)
+        .filter((x) => !x.hasCrosswalk)
+        .map((x) => x.at)
+    : [];
 
-  // Amber on any injury history along the route; red where injuries are frequent
-  // (severity-weighted) or anyone was killed or severely hurt.
-  const high =
-    corridorRatio >= 0.25 || weightedPerKm >= 8 || highRiskCount >= 1;
-  const medium =
-    corridorRatio >= 0.05 || weightedPerKm >= 3 || crashCount >= 3;
-  const level: SafetyLevel = high ? 'high' : medium ? 'medium' : 'low';
-
-  // Corridor exposure dominates the ranking; the weighted crash rate and any KSI
-  // only separate routes whose corridor use is close.
+  // Total exposure over the whole trip, not a rate per km: a longer detour
+  // past the same crashes is no safer, so it mustn't score as if it were.
+  // Busy-road distance dominates (10 m of corridor counts about as much as a
+  // severe crash, and a busy road crossed without a crosswalk as much as 10 m
+  // along one); crashes and any fatal or severe ones separate routes whose
+  // busy-road use is close.
   const riskScore =
-    corridorRatio * 10000 + weightedPerKm * 5 + highRiskCount * 25;
+    onCorridor * 10 + crashWeight * 5 + highRiskCount * 25 + unsafeCrossings.length * 100;
 
   return {
     ...route,
@@ -723,49 +1261,55 @@ function scoreRoute(
     segOnCorridor,
     crashCount,
     highRiskCount,
-    weightedPerKm,
-    level,
+    crashShare,
+    unsafeCrossings,
+    crossingsChecked: crossings !== null,
     riskScore,
-    rank: 0,
+    role: null,
   };
 }
 
-// A route only counts as genuinely clear if it neither touches a safety
-// corridor nor has a nearby high-risk crash — the two things that actually
-// draw alarming amber lines / red dots on the map.
+// The goal for the safest route: no busy main roads, no past crashes, and no
+// busy road crossed without a crosswalk.
 function isRouteClear(r: ScoredRoute): boolean {
-  return r.corridorMeters === 0 && r.highRiskCount === 0;
+  return r.corridorMeters === 0 && r.crashCount === 0 && r.unsafeCrossings.length === 0;
 }
 
-// Show at most this many alternatives, one per label, so no two match.
-const MAX_ROUTES = 3;
-
-// Safest first. A genuinely clear route (no corridor, no high-risk crash
-// nearby) always beats one that merely scores lower on the weighted risk
-// formula; equal risk goes to the quicker route, so the order is never a tie.
+// Safest first. A route that's clear of every hazard always beats one that
+// merely scores lower on the weighted risk formula; equal risk goes to the
+// shorter route, so the order is never a tie.
 function compareSafety(a: ScoredRoute, b: ScoredRoute): number {
   const aClear = isRouteClear(a) ? 0 : 1;
   const bClear = isRouteClear(b) ? 0 : 1;
   if (aClear !== bClear) return aClear - bClear;
-  return a.riskScore - b.riskScore || a.seconds - b.seconds;
+  return a.riskScore - b.riskScore || a.meters - b.meters || a.seconds - b.seconds;
 }
 
-// A route showing the same time and distance as a lower-risk one is never
-// the better pick, so it's dropped.
+function pickSafest(pool: ScoredRoute[]): ScoredRoute {
+  return [...pool].sort(compareSafety)[0];
+}
+
+// The fastest route is the shortest one; equal lengths go to the safer.
+function pickFastest(pool: ScoredRoute[]): ScoredRoute {
+  return [...pool].sort((a, b) => a.meters - b.meters || compareSafety(a, b))[0];
+}
+
+// The two routes offered, always both, safest first: [safest, fastest]. When
+// one route is both, it appears twice, once in each role.
 function rankRoutes(pool: ScoredRoute[]): ScoredRoute[] {
-  const shown: ScoredRoute[] = [];
-  for (const r of [...pool].sort(compareSafety)) {
-    const looksSame = shown.some(
-      (s) =>
-        formatDuration(s.seconds) === formatDuration(r.seconds) &&
-        formatDistance(s.meters) === formatDistance(r.meters),
-    );
-    if (!looksSame && shown.length < MAX_ROUTES) shown.push(r);
-  }
-  shown.forEach((r, i) => {
-    r.rank = i;
-  });
-  return shown;
+  return [
+    { ...pickSafest(pool), role: 'safest' },
+    { ...pickFastest(pool), role: 'fastest' },
+  ];
+}
+
+function isSameRoute(a: Route, b: Route): boolean {
+  return (
+    a.points.length === b.points.length &&
+    a.points.every(
+      (p, i) => p.latitude === b.points[i].latitude && p.longitude === b.points[i].longitude,
+    )
+  );
 }
 
 // --- Safer detours ---
@@ -775,44 +1319,30 @@ function rankRoutes(pool: ScoredRoute[]): ScoredRoute[] {
 
 // How far to the side of a danger spot to aim a detour.
 const DETOUR_OFFSET_M: Record<'walk' | 'bike', number> = { walk: 250, bike: 400 };
-// A detour may take at most 60% longer than the quickest route, and never
-// more than 15 extra minutes.
-const DETOUR_MAX_RATIO = 1.6;
-const DETOUR_MAX_EXTRA_S = 15 * 60;
+// A detour may take up to twice as long as the fastest route, and at most 25
+// extra minutes, so the safest option stays one people would actually take.
+const DETOUR_MAX_RATIO = 2;
+const DETOUR_MAX_EXTRA_S = 25 * 60;
 // Each round tries both sides of the worst spots on the current safest route;
-// if a round finds nothing safer, the next aims twice as far out.
-const DETOUR_ROUNDS = 2;
-const DETOUR_SPOTS = 2;
+// if a round finds nothing safer, the next aims twice as far out. The search
+// stops early once the safest route has no danger spots left.
+const DETOUR_ROUNDS = 3;
+const DETOUR_SPOTS = 3;
 // Danger spots closer together than this are treated as one.
 const SPOT_MERGE_M = 150;
 
 type DangerSpot = { at: LatLng; weight: number; seg: number };
 
-function fromXY(x: number, y: number): LatLng {
-  return { latitude: y / M_PER_DEG_LAT, longitude: x / M_PER_DEG_LON };
-}
 
-function nearestSeg(p: LatLng, pts: LatLng[]): number {
-  let best = 0;
-  let bestM = Infinity;
-  for (let i = 0; i < pts.length - 1; i++) {
-    const m = pointToSegMeters(p, pts[i], pts[i + 1]);
-    if (m < bestM) {
-      bestM = m;
-      best = i;
-    }
-  }
-  return best;
-}
-
-// Where a route meets danger: medium- and high-risk crashes beside it, and
-// each stretch along a safety corridor (100 m counts like one severe crash).
-// Nearby spots are merged; heaviest first.
+// Where a route meets danger: every crash beside it, and each stretch along a
+// safety corridor (100 m counts like one severe crash). Nearby spots are
+// merged; heaviest first. Unmarked crossings are fixed separately, by routing
+// through the nearest crosswalk.
 function dangerSpots(r: ScoredRoute): DangerSpot[] {
   const pts = r.points;
   const raw: DangerSpot[] = [];
   for (const c of r.crashes) {
-    if (c.weight >= 2) raw.push({ at: c.at, weight: c.weight, seg: nearestSeg(c.at, pts) });
+    raw.push({ at: c.at, weight: c.weight, seg: nearestSeg(c.at, pts) });
   }
   let runStart = -1;
   let runM = 0;
@@ -852,6 +1382,13 @@ function sidePoints(spot: DangerSpot, pts: LatLng[], offsetM: number): LatLng[] 
   );
 }
 
+// A route's detour points plus one more, in the order the route reaches them,
+// so a new fix keeps the earlier ones.
+function withVia(r: Route, v: LatLng): LatLng[] {
+  const order = (p: LatLng) => nearestSeg(p, r.points);
+  return [...(r.via ?? []), v].sort((a, b) => order(a) - order(b));
+}
+
 // A route forced through a point can run up a dead end and straight back.
 function hasBacktrack(pts: LatLng[]): boolean {
   for (let i = 0; i < pts.length; i++) {
@@ -885,119 +1422,94 @@ function sameRoute(a: Route, b: Route): boolean {
   return overlapShare(a.points, b.points) > 0.9 && overlapShare(b.points, a.points) > 0.9;
 }
 
-// The level a route is labeled and colored with. Alternatives are ranked
-// against each other so each gets a different label: of three, the safest is
-// Low risk, the next Medium risk, the last High risk. Of two, the second is
-// High risk only if it's risky on its own, otherwise Medium risk. A lone
-// route just uses its own level.
-function routeLevel(r: ScoredRoute, total: number): SafetyLevel {
-  if (total < 2) return r.level;
-  if (r.rank === 0) return 'low';
-  if (total === 2) return r.level === 'high' ? 'high' : 'medium';
-  return r.rank >= total - 1 ? 'high' : 'medium';
+// The two options are named for what they're for, and colored to match:
+// green for the safest route, grey for the fastest.
+function routeName(r: ScoredRoute): string {
+  return r.role === 'safest' ? 'Safest' : 'Fastest';
 }
 
-function routeName(r: ScoredRoute, total: number): string {
-  const level = routeLevel(r, total);
-  return level === 'low' ? 'Low risk' : level === 'medium' ? 'Medium risk' : 'High risk';
+function routeColor(r: ScoredRoute, alpha = 1): string {
+  return r.role === 'safest' ? `rgba(52,199,89,${alpha})` : `rgba(142,142,147,${alpha})`;
 }
 
-// Low risk (green) -> medium risk (yellow) -> high risk (red).
-function safetyColor(level: SafetyLevel): string {
-  return level === 'low' ? '#34C759' : level === 'medium' ? '#FFCC00' : '#FF3B30';
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+// What a route still runs into, e.g. ["0.1 mi of busy main roads",
+// "2 crash sites", "1 busy-road crossing without a crosswalk"]. Empty means
+// it avoids everything checked.
+function remainingHazards(r: ScoredRoute): string[] {
+  const out: string[] = [];
+  if (r.corridorMeters > 0) out.push(`${formatDistance(r.corridorMeters)} of busy main roads`);
+  if (r.crashCount > 0) out.push(plural(r.crashCount, 'crash site'));
+  if (r.unsafeCrossings.length > 0) {
+    out.push(plural(r.unsafeCrossings.length, 'busy-road crossing') + ' without a crosswalk');
+  }
+  return out;
 }
 
-// Translucent variant for the un-selected alternative routes.
-function altColor(level: SafetyLevel): string {
-  return level === 'low'
-    ? 'rgba(52,199,89,0.75)'
-    : level === 'medium'
-      ? 'rgba(255,204,0,0.75)'
-      : 'rgba(255,59,48,0.8)';
+// One line for the safest route: what it avoids, or what it couldn't.
+function safestSummary(r: ScoredRoute): string {
+  const left = remainingHazards(r);
+  const avoided = r.crossingsChecked
+    ? 'busy main roads, crash sites and crossings without a crosswalk'
+    : 'busy main roads and crash sites';
+  if (!left.length) return `Avoids all ${avoided}.`;
+  return `No route within reach avoids everything. Still passes ${joinAnd(left)}.`;
 }
 
-// --- Crash dots on the map ---
+// --- Explaining the pick ---
 
-// Where the map starts if the device location isn't available: downtown San José.
-const DEFAULT_REGION: MapRegion = {
-  latitude: 37.3382,
-  longitude: -121.8863,
-  latitudeDelta: 0.03,
-  longitudeDelta: 0.03,
-};
-// Crash dots only load once the map is zoomed in at least this far, so a
-// city-wide view doesn't try to draw thousands of markers.
-const MAX_CRASH_DELTA = 0.06;
-const MAP_CRASH_LIMIT = 500;
-
-// Severity is only ever shown as a risk level: high (fatal or severe) red,
-// medium (moderate) orange, low (minor) green.
-function crashRisk(c: Crash): 'High' | 'Medium' | 'Low' {
-  return c.highRisk ? 'High' : c.severity === 'moderate' ? 'Medium' : 'Low';
+// One sentence comparing the shown route with another option, e.g. "Compared
+// with the fastest route, this one passes 4 fewer past pedestrian crashes
+// and 0.3 mi less of busy main roads, and takes 3 min longer."
+function comparePhrase(r: ScoredRoute, other: ScoredRoute, mode: TravelMode): string[] {
+  const parts: string[] = [];
+  const crashDiff = other.crashCount - r.crashCount;
+  if (crashDiff !== 0) {
+    const n = Math.abs(crashDiff);
+    const crashes = `${CRASH_NOUN[mode]} crash${n === 1 ? '' : 'es'}`;
+    parts.push(`${n} ${crashDiff > 0 ? 'fewer' : 'more'} past ${crashes}`);
+  }
+  const roadDiff = other.corridorMeters - r.corridorMeters;
+  if (Math.abs(roadDiff) >= 50) {
+    parts.push(`${formatDistance(Math.abs(roadDiff))} ${roadDiff > 0 ? 'less' : 'more'} of busy main roads`);
+  }
+  const xDiff = other.unsafeCrossings.length - r.unsafeCrossings.length;
+  if (xDiff !== 0) {
+    parts.push(
+      `${Math.abs(xDiff)} ${xDiff > 0 ? 'fewer' : 'more'} busy-road crossing${Math.abs(xDiff) === 1 ? '' : 's'} without a crosswalk`,
+    );
+  }
+  return parts;
 }
 
-function crashColor(c: Crash): string {
-  const risk = crashRisk(c);
-  return risk === 'High' ? '#FF3B30' : risk === 'Medium' ? '#FF9500' : '#34C759';
+function joinAnd(parts: string[]): string {
+  return parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0];
 }
 
-// e.g. "High risk · Car and pedestrian"
-function crashTitle(c: Crash): string {
-  return `${crashRisk(c)} risk · ${c.kind}`;
+function explainRoute(
+  r: ScoredRoute,
+  all: ScoredRoute[],
+  mode: TravelMode,
+): string {
+  const fastest = all.find((x) => x.role === 'fastest') ?? all[0];
+  const safest = all.find((x) => x.role === 'safest') ?? all[0];
+  if (isSameRoute(fastest, safest)) {
+    return 'Good news: the safest route is also the fastest, so both options are the same route.';
+  }
+  const other = r.role === 'safest' ? fastest : safest;
+  const name = r.role === 'safest' ? 'the fastest route' : 'the safest route';
+  const parts = comparePhrase(r, other, mode);
+  const extra = Math.round((r.seconds - other.seconds) / 60);
+  const time =
+    extra > 0 ? `takes ${extra} min longer` : extra < 0 ? `saves ${-extra} min` : 'takes about the same time';
+  if (!parts.length) return `Compared with ${name}, this one ${time}.`;
+  return `Compared with ${name}, this one passes ${joinAnd(parts)}, and ${time}.`;
 }
 
-// What to call a mode's crashes in route summaries.
-const CRASH_NOUN: Record<TravelMode, string> = {
-  walk: 'pedestrian',
-  bike: 'bike',
-  drive: 'car',
-};
-
-function crashCountText(n: number, mode: TravelMode): string {
-  return `${n} ${CRASH_NOUN[mode]} crash${n === 1 ? '' : 'es'}`;
-}
-
-function formatCrashDate(ms: number): string {
-  // The timestamp already holds local time, so format it as UTC to avoid
-  // shifting it by the phone's own time zone.
-  return new Date(ms).toLocaleString('en-US', {
-    timeZone: 'UTC',
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-  });
-}
-
-function bboxOfRegion(r: MapRegion): BBox {
-  return [
-    r.longitude - r.longitudeDelta / 2,
-    r.latitude - r.latitudeDelta / 2,
-    r.longitude + r.longitudeDelta / 2,
-    r.latitude + r.latitudeDelta / 2,
-  ];
-}
-
-function googleMapsUrl(route: Route, mode: GoogleTravelMode = 'walking'): string {
-  const pts = route.points;
-  const at = (p: LatLng) => `${p.latitude},${p.longitude}`;
-  const params = new URLSearchParams({
-    api: '1',
-    origin: at(pts[0]),
-    destination: at(pts[pts.length - 1]),
-    travelmode: mode,
-  });
-  // Only Drive hands off to Google Maps, and it uses Google's own default
-  // route. Walk and Bike navigate in-app instead (NavigationView), since
-  // Google can only follow a custom path by turning it into stops.
-  return `https://www.google.com/maps/dir/?${params.toString()}`;
-}
-
-function openInGoogleMaps(route: Route, mode: GoogleTravelMode = 'walking') {
-  Linking.openURL(googleMapsUrl(route, mode)).catch(() =>
-    Alert.alert('Could not open Google Maps on this device.'),
-  );
+// Crashes along a route that happened in the dark or at dusk.
+function afterDarkCount(r: ScoredRoute): number {
+  return r.crashes.filter((c) => /^(dark|dusk)/i.test(c.lighting)).length;
 }
 
 // --- Weather (Open-Meteo, free and no key required) ---
@@ -1039,7 +1551,7 @@ function weatherDescription(code: number): string {
   return descriptions[code] ?? 'Current conditions';
 }
 
-// Current conditions near a point along the route (Fahrenheit, for San José).
+// Current conditions near a point along the route (Fahrenheit, for San Jose).
 async function fetchWeather(point: LatLng): Promise<Weather | null> {
   const params = new URLSearchParams({
     latitude: String(point.latitude),
@@ -1047,13 +1559,13 @@ async function fetchWeather(point: LatLng): Promise<Weather | null> {
     current_weather: 'true',
     temperature_unit: 'fahrenheit',
   });
-  const res = await fetch(`${OPEN_METEO_URL}?${params.toString()}`);
-  const json = await res.json();
+  const json = await fetchJson(`${OPEN_METEO_URL}?${params.toString()}`);
   const current = json.current_weather;
   if (!current) return null;
   return {
     tempF: Math.round(current.temperature),
     description: weatherDescription(current.weathercode),
+    isDay: current.is_day !== 0,
   };
 }
 
@@ -1078,63 +1590,6 @@ const NAV_PROFILE: Record<
   bike: { prealert: 150, now: 30, zoom: 17, altitude: 600 },
 };
 
-// Running distance along the route to each point, in segMeters' local scale.
-function cumulativeMeters(pts: LatLng[]): number[] {
-  const out = [0];
-  for (let i = 1; i < pts.length; i++) {
-    out.push(out[i - 1] + segMeters(pts[i - 1], pts[i]));
-  }
-  return out;
-}
-
-type RouteSnap = {
-  at: LatLng; // closest point on the route
-  along: number; // metres along the route to `at`
-  off: number; // metres from the user to `at`
-  seg: number; // index of the segment `at` lies on
-};
-
-// Closest point to p on route segments [from, to).
-function snapToRoute(
-  p: LatLng,
-  pts: LatLng[],
-  cum: number[],
-  from: number,
-  to: number,
-): RouteSnap {
-  const P = toXY(p);
-  let best: RouteSnap = { at: pts[0], along: 0, off: Infinity, seg: 0 };
-  const end = Math.min(pts.length - 1, to);
-  for (let i = Math.max(0, from); i < end; i++) {
-    const A = toXY(pts[i]);
-    const B = toXY(pts[i + 1]);
-    const dx = B.x - A.x;
-    const dy = B.y - A.y;
-    const len2 = dx * dx + dy * dy;
-    let t = len2 === 0 ? 0 : ((P.x - A.x) * dx + (P.y - A.y) * dy) / len2;
-    t = Math.max(0, Math.min(1, t));
-    const off = Math.hypot(P.x - (A.x + t * dx), P.y - (A.y + t * dy));
-    if (off < best.off) {
-      best = {
-        at: {
-          latitude: pts[i].latitude + t * (pts[i + 1].latitude - pts[i].latitude),
-          longitude: pts[i].longitude + t * (pts[i + 1].longitude - pts[i].longitude),
-        },
-        along: cum[i] + t * Math.sqrt(len2),
-        off,
-        seg: i,
-      };
-    }
-  }
-  return best;
-}
-
-// Compass bearing from a to b, in degrees clockwise from north.
-function bearingDeg(a: LatLng, b: LatLng): number {
-  const A = toXY(a);
-  const B = toXY(b);
-  return ((Math.atan2(B.x - A.x, B.y - A.y) * 180) / Math.PI + 360) % 360;
-}
 
 function maneuverIcon(step: Step): IconName {
   if (step.type === 'arrive') return 'place';
@@ -1159,15 +1614,6 @@ function maneuverIcon(step: Step): IconName {
     default:
       return 'straight';
   }
-}
-
-// "300 ft" reads aloud as "300 feet"; same for miles.
-function spokenDistance(m: number): string {
-  return formatDistance(m).replace(' ft', ' feet').replace(' mi', ' miles');
-}
-
-function lowerFirst(s: string): string {
-  return s.charAt(0).toLowerCase() + s.slice(1);
 }
 
 // Full-screen guidance along one route: a map that follows the user, the next
@@ -1214,6 +1660,12 @@ function NavigationView({
   // Stops when the user drags the map; "Re-center" turns it back on.
   const [following, setFollowing] = useState(true);
   const [muted, setMuted] = useState(false);
+  // Map orientation: the direction of travel up (default), or north up.
+  const [northUp, setNorthUp] = useState(false);
+  // Tilted 3D view (default) or flat top-down 2D.
+  const [threeD, setThreeD] = useState(true);
+  // Which way the map is turned, in degrees from north, for the compass.
+  const [mapHeading, setMapHeading] = useState(0);
   const lastSeg = useRef(0);
   const offFixes = useRef(0);
   const heading = useRef(pts.length > 1 ? bearingDeg(pts[0], pts[1]) : 0);
@@ -1303,12 +1755,16 @@ function NavigationView({
     }
   }, [pos, snap, offRoute, arrived, muted]);
 
+  const cameraHeading = () => (northUp ? 0 : heading.current);
+  const cameraPitch = threeD ? 45 : 0;
+
   function followCamera(p: LatLng) {
+    setMapHeading(cameraHeading());
     mapRef.current?.animateCamera(
       {
         center: p,
-        heading: heading.current,
-        pitch: 45,
+        heading: cameraHeading(),
+        pitch: cameraPitch,
         zoom: profile.zoom, // Google Maps (Android)
         altitude: profile.altitude, // Apple Maps (iOS)
       },
@@ -1318,7 +1774,18 @@ function NavigationView({
 
   useEffect(() => {
     if (pos && following) followCamera(pos);
-  }, [pos, following]);
+  }, [pos, following, northUp, threeD]);
+
+  // While the user is looking around, the compass and 2D/3D buttons only turn
+  // or tilt the map where it is.
+  useEffect(() => {
+    if (following) return;
+    if (northUp) setMapHeading(0);
+    mapRef.current?.animateCamera(
+      northUp ? { heading: 0, pitch: cameraPitch } : { pitch: cameraPitch },
+      { duration: 400 },
+    );
+  }, [northUp, threeD]);
 
   // Grey behind the user, blue ahead.
   const walked = snap ? [...pts.slice(0, snap.seg + 1), snap.at] : [];
@@ -1363,7 +1830,7 @@ function NavigationView({
         initialCamera={{
           center: pts[0],
           heading: heading.current,
-          pitch: 45,
+          pitch: cameraPitch,
           zoom: profile.zoom,
           altitude: profile.altitude,
         }}
@@ -1372,6 +1839,13 @@ function NavigationView({
         showsCompass={false}
         toolbarEnabled={false}
         onPanDrag={() => setFollowing(false)}
+        // Keep the compass true if the map was turned by hand.
+        onRegionChangeComplete={() => {
+          mapRef.current
+            ?.getCamera()
+            .then((c) => setMapHeading(c.heading ?? 0))
+            .catch(() => {});
+        }}
       >
         {walked.length > 1 && (
           <Polyline coordinates={walked} strokeColor="#8E8E93" strokeWidth={6} />
@@ -1391,6 +1865,9 @@ function NavigationView({
       </MapView>
 
       <View
+        accessible
+        accessibilityLiveRegion="polite"
+        accessibilityLabel={detail ? `${headline}. ${detail}` : headline}
         style={[
           styles.navBanner,
           offRoute && !arrived && styles.navBannerOff,
@@ -1409,18 +1886,50 @@ function NavigationView({
       </View>
 
       <View style={styles.navBottom}>
-        {!following && (
-          <Pressable
-            style={styles.navRecenter}
-            onPress={() => {
-              setFollowing(true);
-              if (pos) followCamera(pos);
-            }}
-          >
-            <MaterialIcons name="navigation" size={18} color="#007AFF" />
-            <Text style={styles.navRecenterText}>Re-center</Text>
-          </Pressable>
-        )}
+        <View style={styles.navControlsRow}>
+          {!following ? (
+            <Pressable
+              style={styles.navRecenter}
+              accessibilityRole="button"
+              onPress={() => {
+                setFollowing(true);
+                if (pos) followCamera(pos);
+              }}
+            >
+              <MaterialIcons name="navigation" size={18} color="#007AFF" />
+              <Text style={styles.navRecenterText}>Re-center</Text>
+            </Pressable>
+          ) : (
+            <View />
+          )}
+          <View style={styles.navMapButtons}>
+            <Pressable
+              style={[styles.navMapButton, northUp && styles.navMapButtonOn]}
+              accessibilityRole="button"
+              accessibilityState={{ selected: northUp }}
+              accessibilityLabel={
+                northUp
+                  ? 'Compass, north up. Switch to direction of travel up'
+                  : 'Compass. Switch to north up'
+              }
+              onPress={() => setNorthUp(!northUp)}
+            >
+              {/* The needle turns against the map, so it always points north. */}
+              <View style={{ alignItems: 'center', transform: [{ rotate: `${-mapHeading}deg` }] }}>
+                <Text style={styles.compassN}>N</Text>
+                <MaterialIcons name="navigation" size={20} color="#FF3B30" />
+              </View>
+            </Pressable>
+            <Pressable
+              style={styles.navMapButton}
+              accessibilityRole="button"
+              accessibilityLabel={threeD ? 'Switch to flat 2D map' : 'Switch to tilted 3D map'}
+              onPress={() => setThreeD(!threeD)}
+            >
+              <Text style={styles.navMapButtonText}>{threeD ? '2D' : '3D'}</Text>
+            </Pressable>
+          </View>
+        </View>
         <View style={styles.navFooter}>
           <View style={styles.navFooterText}>
             <Text style={styles.navEta}>
@@ -1435,6 +1944,7 @@ function NavigationView({
           <Pressable
             hitSlop={8}
             style={styles.navIconButton}
+            accessibilityRole="button"
             accessibilityLabel={muted ? 'Unmute voice' : 'Mute voice'}
             onPress={() => {
               if (!muted) Speech.stop();
@@ -1449,6 +1959,8 @@ function NavigationView({
           </Pressable>
           <Pressable
             style={[styles.navEndButton, arrived && styles.navDoneButton]}
+            accessibilityRole="button"
+            accessibilityLabel={arrived ? 'Done' : 'End navigation'}
             onPress={onEnd}
           >
             <Text style={styles.navEndText}>{arrived ? 'Done' : 'End'}</Text>
@@ -1458,6 +1970,596 @@ function NavigationView({
     </View>
   );
 }
+
+// The results under the map, laid out as cards: the two route options, a
+// details card for the selected route, and a map key.
+
+type Tone = 'good' | 'warn' | 'neutral';
+
+const TONE_COLOR: Record<Tone, string> = {
+  good: '#1E8E3E',
+  warn: '#B25000',
+  neutral: '#3A3A3C',
+};
+
+const pct = (share: number) => `${Math.round(share * 100)}%`;
+
+function SectionTitle({ children }: { children: string }) {
+  return (
+    <Text style={cardStyles.sectionTitle} accessibilityRole="header">
+      {children}
+    </Text>
+  );
+}
+
+// One small figure in a route card, e.g. "8%" over "Crash sites".
+function Stat({ value, label, tone }: { value: string; label: string; tone: Tone }) {
+  return (
+    <View style={cardStyles.stat}>
+      <Text style={[cardStyles.statValue, { color: TONE_COLOR[tone] }]}>{value}</Text>
+      <Text style={cardStyles.statLabel}>{label}</Text>
+    </View>
+  );
+}
+
+function RouteOptionCard({
+  route,
+  selected,
+  sameAsFastest,
+  crashDataFailed,
+  onPress,
+}: {
+  route: ScoredRoute;
+  selected: boolean;
+  sameAsFastest: boolean;
+  crashDataFailed: boolean;
+  onPress: () => void;
+}) {
+  const safest = route.role === 'safest';
+  const unsafe = route.unsafeCrossings.length;
+  const left = remainingHazards(route).length;
+  return (
+    <Pressable
+      style={[cardStyles.card, cardStyles.optionCard, selected && cardStyles.optionSelected]}
+      accessibilityRole="button"
+      accessibilityState={{ selected }}
+      accessibilityHint="Shows this route on the map"
+      onPress={onPress}
+    >
+      <View style={cardStyles.optionHeader}>
+        <View style={[cardStyles.roleDot, { backgroundColor: routeColor(route) }]} />
+        <View style={cardStyles.optionTitleWrap}>
+          <Text style={cardStyles.optionTitle}>{routeName(route)}</Text>
+          {(safest || sameAsFastest) && (
+            <View style={cardStyles.tagRow}>
+              {safest && (
+                <View style={[cardStyles.tag, cardStyles.tagGreen]}>
+                  <MaterialIcons name="verified-user" size={12} color="#1E8E3E" />
+                  <Text style={[cardStyles.tagText, { color: '#1E8E3E' }]}>Recommended</Text>
+                </View>
+              )}
+              {safest && sameAsFastest && (
+                <View style={[cardStyles.tag, cardStyles.tagBlue]}>
+                  <MaterialIcons name="bolt" size={12} color="#0A5CE0" />
+                  <Text style={[cardStyles.tagText, { color: '#0A5CE0' }]}>Same as fastest</Text>
+                </View>
+              )}
+            </View>
+          )}
+        </View>
+        <View style={cardStyles.optionTime}>
+          <Text style={cardStyles.optionMinutes}>{formatDuration(route.seconds)}</Text>
+          <Text style={cardStyles.optionDistance}>{formatDistance(route.meters)}</Text>
+        </View>
+      </View>
+
+      <View style={cardStyles.statRow}>
+        <Stat
+          value={crashDataFailed ? '—' : pct(route.crashShare)}
+          label="Near crash sites"
+          tone={crashDataFailed ? 'neutral' : route.crashShare > 0 ? 'warn' : 'good'}
+        />
+        <Stat
+          value={pct(route.corridorRatio)}
+          label="On busy roads"
+          tone={route.corridorMeters > 0 ? 'warn' : 'good'}
+        />
+        {route.crossingsChecked && (
+          <Stat
+            value={unsafe === 0 ? 'All safe' : `${unsafe}`}
+            label={unsafe === 0 ? 'Crossings' : `No crosswalk`}
+            tone={unsafe === 0 ? 'good' : 'warn'}
+          />
+        )}
+      </View>
+
+      {safest && !crashDataFailed && (
+        <View style={cardStyles.summaryRow}>
+          <MaterialIcons
+            name={left ? 'error-outline' : 'check-circle'}
+            size={16}
+            color={TONE_COLOR[left ? 'warn' : 'good']}
+          />
+          <Text style={[cardStyles.summaryText, { color: TONE_COLOR[left ? 'warn' : 'good'] }]}>
+            {safestSummary(route)}
+          </Text>
+        </View>
+      )}
+    </Pressable>
+  );
+}
+
+// A highlighted note: a warning, a tip or an explanation.
+function Callout({
+  icon,
+  tone,
+  children,
+}: {
+  icon: IconName;
+  tone: 'warn' | 'info' | 'night';
+  children: ReactNode;
+}) {
+  const palette = {
+    warn: { bg: '#FFF4E5', fg: '#8A4B00' },
+    info: { bg: '#EEF4FF', fg: '#1C3D7A' },
+    night: { bg: '#EFEFF4', fg: '#2C2C2E' },
+  }[tone];
+  return (
+    <View style={[cardStyles.callout, { backgroundColor: palette.bg }]}>
+      <MaterialIcons name={icon} size={18} color={palette.fg} />
+      <Text style={[cardStyles.calloutText, { color: palette.fg }]}>{children}</Text>
+    </View>
+  );
+}
+
+// A labeled fact about the selected route, e.g. "Busy main roads · None".
+function FactRow({
+  icon,
+  label,
+  value,
+  tone,
+  last,
+}: {
+  icon: IconName;
+  label: string;
+  value: string;
+  tone: Tone;
+  last?: boolean;
+}) {
+  return (
+    <View style={[cardStyles.factRow, !last && cardStyles.factDivider]}>
+      <MaterialIcons name={icon} size={20} color="#8E8E93" />
+      <Text style={cardStyles.factLabel}>{label}</Text>
+      <Text style={[cardStyles.factValue, { color: TONE_COLOR[tone] }]}>{value}</Text>
+    </View>
+  );
+}
+
+// The selected route's heading, with distance, time and current weather.
+function DetailsHeader({
+  title,
+  meters,
+  seconds,
+  verb,
+  weather,
+}: {
+  title: string;
+  meters: number;
+  seconds: number;
+  verb: string;
+  weather: Weather | null;
+}) {
+  return (
+    <View style={cardStyles.detailsHeader}>
+      <View style={{ flex: 1 }}>
+        <Text style={cardStyles.detailsTitle}>{title}</Text>
+        <Text style={cardStyles.detailsSub}>
+          {formatDistance(meters)} · {formatDuration(seconds)} {verb}
+        </Text>
+      </View>
+      {weather && (
+        <View style={cardStyles.weatherChip}>
+          <MaterialIcons
+            name={weather.isDay ? 'wb-sunny' : 'nightlight-round'}
+            size={14}
+            color="#3A3A3C"
+          />
+          <Text style={cardStyles.weatherText}>
+            {weather.tempF}°F · {weather.description}
+          </Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
+function Card({ children }: { children: ReactNode }) {
+  return <View style={cardStyles.card}>{children}</View>;
+}
+
+function KeyItem({ swatch, label }: { swatch: ReactNode; label: string }) {
+  return (
+    <View style={cardStyles.keyItem}>
+      <View style={cardStyles.keySwatch}>{swatch}</View>
+      <Text style={cardStyles.keyText}>{label}</Text>
+    </View>
+  );
+}
+
+function KeyGroup({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <View style={cardStyles.keyGroup}>
+      <Text style={cardStyles.keyGroupTitle}>{title}</Text>
+      <View style={cardStyles.keyGrid}>{children}</View>
+    </View>
+  );
+}
+
+const crashDot = (color: string, ring?: string) => (
+  <View
+    style={[
+      cardStyles.keyDot,
+      { backgroundColor: color },
+      ring ? { width: 16, height: 16, borderRadius: 8, borderWidth: 3, borderColor: ring } : null,
+    ]}
+  />
+);
+
+// What every line, pin and dot on the map means, and where the data comes
+// from. Colors come from MAP_COLORS, the same ones the map is drawn with.
+function MapKey({
+  crashNoun,
+  showCrossings,
+  note,
+}: {
+  crashNoun: string;
+  showCrossings: boolean;
+  note: string;
+}) {
+  return (
+    <View style={[cardStyles.card, cardStyles.keyCard]}>
+      <KeyGroup title="Routes">
+        <KeyItem
+          swatch={<View style={[cardStyles.keyLine, { backgroundColor: MAP_COLORS.selectedRoute }]} />}
+          label="Selected route"
+        />
+        <KeyItem
+          swatch={
+            <View style={cardStyles.keyDashed}>
+              {[0, 1, 2].map((i) => (
+                <View key={i} style={[cardStyles.keyDash, { backgroundColor: MAP_COLORS.otherRoute }]} />
+              ))}
+            </View>
+          }
+          label="Other option"
+        />
+        <KeyItem
+          swatch={<View style={[cardStyles.keyLine, { height: 7, backgroundColor: MAP_COLORS.busyRoad }]} />}
+          label="Busy main road"
+        />
+      </KeyGroup>
+
+      <KeyGroup title="Places">
+        <KeyItem
+          swatch={<MaterialIcons name="place" size={20} color={MAP_COLORS.start} />}
+          label="Start"
+        />
+        <KeyItem
+          swatch={<MaterialIcons name="place" size={20} color={MAP_COLORS.destination} />}
+          label="Destination"
+        />
+        <KeyItem swatch={<View style={cardStyles.keyYou} />} label="You" />
+      </KeyGroup>
+
+      <KeyGroup title={`Past ${crashNoun} crashes`}>
+        {CRASH_SEVERITY_KEY.map((k) => (
+          <KeyItem key={k.label} swatch={crashDot(k.color)} label={k.label} />
+        ))}
+        <KeyItem
+          swatch={crashDot(MAP_COLORS.crashSerious, MAP_COLORS.crashPicked)}
+          label="Crash you tapped"
+        />
+      </KeyGroup>
+
+      {showCrossings && (
+        <KeyGroup title="Crossings">
+          <KeyItem
+            swatch={
+              <View style={[cardStyles.keyXing, { backgroundColor: MAP_COLORS.noCrosswalk }]}>
+                <MaterialIcons name="priority-high" size={10} color="#fff" />
+              </View>
+            }
+            label="Crosses a busy road with no crosswalk"
+          />
+        </KeyGroup>
+      )}
+
+      <Text style={cardStyles.keyNote}>{note}</Text>
+    </View>
+  );
+}
+
+const cardStyles = StyleSheet.create({
+  sectionTitle: {
+    marginTop: 24,
+    marginBottom: 10,
+    fontSize: 13,
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+    color: '#8E8E93',
+    fontFamily: FONT.semibold,
+  },
+  card: {
+    padding: 14,
+    borderRadius: 16,
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#E5E5EA',
+    marginBottom: 10,
+  },
+  optionCard: {
+    borderWidth: 1.5,
+  },
+  optionSelected: {
+    borderColor: '#007AFF',
+    backgroundColor: '#F3F8FF',
+  },
+  optionHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  roleDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    marginTop: 6,
+    marginRight: 10,
+  },
+  optionTitleWrap: {
+    flex: 1,
+  },
+  optionTitle: {
+    fontSize: 18,
+    color: '#1C1C1E',
+    fontFamily: FONT.bold,
+  },
+  tagRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 6,
+  },
+  tag: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 8,
+  },
+  tagGreen: { backgroundColor: '#E6F4EA' },
+  tagBlue: { backgroundColor: '#E8F0FE' },
+  tagText: {
+    fontSize: 11,
+    letterSpacing: 0.3,
+    textTransform: 'uppercase',
+    fontFamily: FONT.semibold,
+  },
+  optionTime: {
+    alignItems: 'flex-end',
+    marginLeft: 12,
+  },
+  optionMinutes: {
+    fontSize: 20,
+    color: '#1C1C1E',
+    fontFamily: FONT.bold,
+  },
+  optionDistance: {
+    fontSize: 13,
+    color: '#8E8E93',
+    fontFamily: FONT.medium,
+  },
+  statRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 14,
+  },
+  stat: {
+    flex: 1,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: '#F2F2F7',
+  },
+  statValue: {
+    fontSize: 16,
+    fontFamily: FONT.bold,
+  },
+  statLabel: {
+    marginTop: 2,
+    fontSize: 11,
+    color: '#6C6C70',
+    fontFamily: FONT.medium,
+  },
+  summaryRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 6,
+    marginTop: 12,
+  },
+  summaryText: {
+    flex: 1,
+    fontSize: 13,
+    lineHeight: 18,
+    fontFamily: FONT.semibold,
+  },
+  callout: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8,
+    padding: 12,
+    borderRadius: 12,
+    marginBottom: 10,
+  },
+  calloutText: {
+    flex: 1,
+    fontSize: 14,
+    lineHeight: 20,
+    fontFamily: FONT.medium,
+  },
+  factRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 11,
+  },
+  factDivider: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#E5E5EA',
+  },
+  factLabel: {
+    flex: 1,
+    fontSize: 15,
+    color: '#1C1C1E',
+    fontFamily: FONT.regular,
+  },
+  factValue: {
+    flexShrink: 1,
+    textAlign: 'right',
+    fontSize: 15,
+    fontFamily: FONT.semibold,
+  },
+  detailsHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    marginBottom: 12,
+  },
+  detailsTitle: {
+    fontSize: 18,
+    color: '#1C1C1E',
+    fontFamily: FONT.bold,
+  },
+  detailsSub: {
+    marginTop: 2,
+    fontSize: 14,
+    color: '#6C6C70',
+    fontFamily: FONT.medium,
+  },
+  weatherChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 12,
+    backgroundColor: '#F2F2F7',
+    maxWidth: '50%',
+  },
+  weatherText: {
+    flexShrink: 1,
+    fontSize: 12,
+    color: '#3A3A3C',
+    fontFamily: FONT.medium,
+  },
+  keyCard: {
+    backgroundColor: '#F9F9FB',
+  },
+  keyGroup: {
+    paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#E5E5EA',
+  },
+  keyGroupTitle: {
+    marginBottom: 8,
+    fontSize: 12,
+    letterSpacing: 0.4,
+    textTransform: 'uppercase',
+    color: '#8E8E93',
+    fontFamily: FONT.semibold,
+  },
+  keyGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    rowGap: 10,
+  },
+  keyItem: {
+    width: '50%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingRight: 6,
+  },
+  keySwatch: {
+    width: 26,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  keyLine: {
+    width: 24,
+    height: 4,
+    borderRadius: 2,
+  },
+  keyDashed: {
+    width: 24,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  keyDash: {
+    width: 6,
+    height: 3,
+    borderRadius: 1,
+  },
+  keyDot: {
+    width: 13,
+    height: 13,
+    borderRadius: 7,
+    borderWidth: 2,
+    borderColor: '#fff',
+    // A faint outline so the yellow dot shows on the light card.
+    shadowColor: '#000',
+    shadowOpacity: 0.25,
+    shadowRadius: 1,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 1,
+  },
+  keyYou: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    borderWidth: 3,
+    borderColor: '#fff',
+    backgroundColor: '#007AFF',
+    shadowColor: '#007AFF',
+    shadowOpacity: 0.5,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 2,
+  },
+  keyXing: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    borderWidth: 2,
+    borderColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  keyText: {
+    flex: 1,
+    fontSize: 13,
+    lineHeight: 17,
+    color: '#3A3A3C',
+    fontFamily: FONT.regular,
+  },
+  keyNote: {
+    marginTop: 12,
+    fontSize: 12,
+    lineHeight: 17,
+    color: '#8E8E93',
+    fontFamily: FONT.regular,
+  },
+});
 
 export default function App() {
   const [fontsLoaded] = useFonts({
@@ -1480,6 +2582,12 @@ export default function App() {
   const [activeIdx, setActiveIdx] = useState(0);
   const [outOfArea, setOutOfArea] = useState(false);
   const [corridors, setCorridors] = useState<Corridor[]>([]);
+  // San Jose's city limits, the only area its crash data covers.
+  const [cityLimits, setCityLimits] = useState<CityPolygon[]>([]);
+  // A failed download must not read as "no crashes here", so it's tracked and
+  // shown instead of a safety rating.
+  const [crashDataFailed, setCrashDataFailed] = useState(false);
+  const [corridorsFailed, setCorridorsFailed] = useState(false);
   // Drive's single route, scored just for its corridor overlap.
   const [driveResult, setDriveResult] = useState<ScoredRoute | null>(null);
   // Current conditions near the route, fetched alongside it.
@@ -1571,6 +2679,13 @@ export default function App() {
     return corridors.filter((c) => bboxIntersect(c.bbox, box, 0.003));
   }, [ranksRoutes, scored, driveResult, corridors]);
 
+  // Share of the shown route inside San Jose's city limits. Anything outside
+  // has no crash data, so it may look safer than it is.
+  const shownCityShare = useMemo(() => {
+    const r = ranksRoutes ? active : driveResult;
+    return r && cityLimits.length ? cityShare(r.points, cityLimits) : 1;
+  }, [ranksRoutes, active, driveResult, cityLimits]);
+
   // Ask for location once on mount; it centers the map and biases search
   // results toward what's nearby.
   useEffect(() => {
@@ -1599,7 +2714,7 @@ export default function App() {
           longitude: pos.coords.longitude,
         });
       } catch {
-        // No location available; the map stays on San José and searches
+        // No location available; the map stays on San Jose and searches
         // fall back to global ranking.
       } finally {
         setLocationChecked(true);
@@ -1674,11 +2789,20 @@ export default function App() {
     setSelected(item);
   }
 
-  // Load San José's priority safety corridors once.
-  useEffect(() => {
+  // Load San Jose's priority safety corridors and city limits once. If the
+  // corridors fail, the next route search tries again.
+  function loadCorridors() {
+    setCorridorsFailed(false);
     fetchSafetyCorridors()
       .then(setCorridors)
-      .catch(() => setCorridors([]));
+      .catch(() => setCorridorsFailed(true));
+  }
+
+  useEffect(() => {
+    loadCorridors();
+    fetchCityLimits()
+      .then(setCityLimits)
+      .catch(() => setCityLimits([]));
   }, []);
 
   // Score every alternative against the Vision Zero safety corridors and the
@@ -1714,38 +2838,56 @@ export default function App() {
       const crashBox = padBBox(allBox, 0.003 + (offsetM * 2) / M_PER_DEG_LAT);
       let allCrashes: Crash[] = [];
       let inCityData = true;
+      let failed = false;
       try {
         allCrashes = await fetchCrashes(crashBox, travelMode);
-        if (!allCrashes.length) inCityData = await hasAnyCrashes(crashBox);
+        // Without the city limits, an area with no crashes of any kind on
+        // record is taken to be outside the city's data.
+        if (!allCrashes.length && !cityLimits.length) {
+          inCityData = await hasAnyCrashes(crashBox);
+        }
       } catch {
-        allCrashes = [];
+        failed = true;
       }
       if (cancelled) return;
 
-      const score = (r: Route) => scoreRoute(r, corridors, allCrashes);
+      // Crossings are only checked for Walk; bikes cross with traffic.
+      const crossings = travelMode === 'walk' ? bundledCrossingIndex() : null;
+      const score = (r: Route) => scoreRoute(r, corridors, allCrashes, crossings);
       const pool = routes.map(score);
-      const outside =
-        corridors.length > 0 && !inCityData && pool.every((r) => r.corridorMeters === 0);
+      const outside = cityLimits.length
+        ? pool.every((r) => cityShare(r.points, cityLimits) < 0.02)
+        : corridors.length > 0 && !inCityData && pool.every((r) => r.corridorMeters === 0);
 
-      // Try routes through points beside the worst spots on the current safest
-      // route, keeping any that aren't too slow, don't double back, and aren't
-      // repeats. A second round works on whatever is safest after the first.
-      if (!outside) {
+      // Work on the current safest route until it avoids everything or the
+      // rounds run out. Each round tries routing through the nearest crosswalk
+      // for every unmarked crossing, and through points beside the worst
+      // crash and busy-road spots. Earlier detour points are kept, so fixes add
+      // up. Results that are too slow, double back or repeat are dropped.
+      if (!outside && !failed) {
         const origin = routes[0].points[0];
         const dest = routes[0].points[routes[0].points.length - 1];
         const fastest = Math.min(...routes.map((r) => r.seconds));
         const maxSeconds = Math.min(fastest * DETOUR_MAX_RATIO, fastest + DETOUR_MAX_EXTRA_S);
         let reach = offsetM;
         for (let round = 0; round < DETOUR_ROUNDS; round++) {
-          const best = rankRoutes(pool)[0];
-          const vias = dangerSpots(best)
-            .slice(0, DETOUR_SPOTS)
-            .flatMap((spot) => sidePoints(spot, best.points, reach));
-          if (!vias.length) break;
+          const best = pickSafest(pool);
+          if (isRouteClear(best)) break;
+          const tries: LatLng[][] = [];
+          if (crossings) {
+            for (const x of best.unsafeCrossings.slice(0, DETOUR_SPOTS)) {
+              const v = crosswalkNear(x, crossings);
+              if (v) tries.push(withVia(best, v));
+            }
+          }
+          for (const spot of dangerSpots(best).slice(0, DETOUR_SPOTS)) {
+            for (const v of sidePoints(spot, best.points, reach)) tries.push(withVia(best, v));
+          }
+          if (!tries.length) break;
           const found = await Promise.all(
-            vias.map((v) =>
-              fetchRoutes(origin, dest, GOOGLE_MODE[travelMode], false, [v])
-                .then((rs) => rs[0] ?? null)
+            tries.map((via) =>
+              fetchRoutes(origin, dest, GOOGLE_MODE[travelMode], false, via)
+                .then((rs) => (rs[0] ? { ...rs[0], via } : null))
                 .catch(() => null),
             ),
           );
@@ -1755,20 +2897,22 @@ export default function App() {
             if (pool.some((p) => sameRoute(p, r))) continue;
             pool.push(score(r));
           }
-          if (rankRoutes(pool)[0] === best) reach *= 2;
+          if (pickSafest(pool) === best) reach *= 2;
         }
       }
 
       setScored(rankRoutes(pool));
+      // Select the safest route, the recommendation (listed first).
       setActiveIdx(0);
       setOutOfArea(outside);
+      setCrashDataFailed(failed);
       setFindingSafer(false);
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [routes, corridors, travelMode]);
+  }, [routes, corridors, cityLimits, travelMode]);
 
   // Resolves the address to coordinates, using the already-picked suggestion
   // if there is one, otherwise geocoding the text and taking the closest match.
@@ -1789,6 +2933,7 @@ export default function App() {
     Keyboard.dismiss();
     const query = address.trim();
     if (!query) return;
+    if (corridorsFailed) loadCorridors();
 
     if (!coords) {
       Alert.alert('Enable location access to get directions.');
@@ -1826,7 +2971,10 @@ export default function App() {
       }
       setRoutes(found);
     } catch {
-      Alert.alert('Something went wrong loading directions.');
+      Alert.alert(
+        "Couldn't load directions",
+        'The free routing server may be busy or your connection dropped. Please try again in a moment.',
+      );
     } finally {
       setLoading(false);
     }
@@ -1839,6 +2987,7 @@ export default function App() {
     Keyboard.dismiss();
     const query = address.trim();
     if (!query) return;
+    if (corridorsFailed) loadCorridors();
 
     if (!coords) {
       Alert.alert('Enable location access to check the route.');
@@ -1862,14 +3011,23 @@ export default function App() {
       }
       // Drive is scored on vehicle-only crashes (car and car, car and object).
       let carCrashes: Crash[] = [];
+      let failed = false;
       try {
         carCrashes = await fetchCrashes(padBBox(bboxOf(found[0].points), 0.003), 'drive');
       } catch {
-        carCrashes = [];
+        failed = true;
       }
+      setCrashDataFailed(failed);
+      // Drive has no ranking effect to fill this in, so check the weather here.
+      fetchWeather(found[0].points[Math.floor(found[0].points.length / 2)])
+        .then(setWeather)
+        .catch(() => setWeather(null));
       setDriveResult(scoreRoute(found[0], corridors, carCrashes));
     } catch {
-      Alert.alert('Something went wrong checking the route.');
+      Alert.alert(
+        "Couldn't check the route",
+        'The free routing server may be busy or your connection dropped. Please try again in a moment.',
+      );
     } finally {
       setLoading(false);
     }
@@ -1895,9 +3053,42 @@ export default function App() {
   }
 
   // The route drawn on the map: the chosen walk/bike option, or Drive's route.
-  const shownRoute: Route | null = ranksRoutes ? active : driveResult;
+  const shownRoute: ScoredRoute | null = ranksRoutes ? active : driveResult;
   const findRoute = () => (ranksRoutes ? handleRoute() : handleDriveCheck());
   const currentTab = TRAVEL_TABS.find((t) => t.mode === travelMode)!;
+  const expressways = shownRoute ? countyExpressways(shownRoute) : { names: [], meters: 0 };
+  // Gaps in what was checked, shown above the rating so it isn't trusted blindly.
+  const dataWarnings = shownRoute
+    ? ([
+        crashDataFailed &&
+          "Couldn't load the city's crash records, so crashes along this route weren't checked. Try the search again.",
+        corridorsFailed &&
+          "Couldn't load the city's map of busy main roads, so they weren't checked.",
+        !outOfArea &&
+          shownCityShare < 0.9 &&
+          `About ${Math.round((1 - shownCityShare) * 100)}% of this route is outside San Jose city limits. ` +
+            'The city has no crash records there, so those parts may be riskier than shown.',
+        expressways.meters >= 100 &&
+          `This route uses ${expressways.names.join(' and ')} for ${formatDistance(expressways.meters)}. ` +
+            "County expressways aren't in the city's crash records, so that stretch may be riskier than shown.",
+      ].filter(Boolean) as string[])
+    : [];
+  const whyThisRoute = ranksRoutes && active ? explainRoute(active, scored, travelMode) : null;
+  // After sunset, point out crashes along the route that also happened in the dark.
+  const darkCrashes =
+    weather && !weather.isDay && shownRoute ? afterDarkCount(shownRoute) : 0;
+  const warningCallouts = dataWarnings.map((w) => (
+    <Callout key={w} icon="info-outline" tone="warn">
+      {w}
+    </Callout>
+  ));
+  const darkCallout =
+    darkCrashes > 0 ? (
+      <Callout icon="nightlight-round" tone="night">
+        It's dark out. {darkCrashes} of the crashes along this route happened
+        after dark, so stay visible and cross at lit intersections.
+      </Callout>
+    ) : null;
   const crashDetails = pickedCrash
     ? [
         [
@@ -1915,6 +3106,16 @@ export default function App() {
           .join(' · '),
       ].filter(Boolean)
     : [];
+  const busyRoadsValue = (r: ScoredRoute) =>
+    r.corridorMeters === 0
+      ? 'None'
+      : `${formatDistance(r.corridorMeters)} (${Math.round(r.corridorRatio * 100)}%)`;
+  const crashesValue = (r: ScoredRoute) =>
+    crashDataFailed
+      ? 'Not checked'
+      : r.crashCount === 0
+        ? 'None reported'
+        : `${r.crashCount} nearby${r.highRiskCount ? ` · ${r.highRiskCount} serious` : ''}`;
 
   return (
     <View style={styles.container}>
@@ -1927,17 +3128,28 @@ export default function App() {
         keyboardShouldPersistTaps="handled"
       >
         <View style={styles.searchBar}>
-          <Text style={styles.greeting}>
-            Welcome to SafeRoutes San Jose, {USER_NAME}
+          <View style={styles.titleRow}>
+            <View style={styles.logoBadge}>
+              <MaterialIcons name="alt-route" size={22} color="#fff" />
+            </View>
+            <Text style={styles.greeting} accessibilityRole="header">
+              SafeRoutes <Text style={styles.greetingCity}>San Jose</Text>
+            </Text>
+          </View>
+          <Text style={styles.tagline}>
+            Find the safest way to walk, bike or drive to your destination, using
+            San Jose's real crash data.
           </Text>
 
+          <View style={styles.headerDivider} />
+
           <View style={styles.tabRow} accessibilityRole="tablist">
-            {TRAVEL_TABS.map(({ mode, label, icon }) => {
+            {TRAVEL_TABS.map(({ mode, label, icon }, i) => {
               const isActive = travelMode === mode;
               return (
                 <Pressable
                   key={mode}
-                  style={styles.tabButton}
+                  style={[styles.tabButton, i > 0 && styles.tabButtonDivided]}
                   accessibilityRole="tab"
                   accessibilityState={{ selected: isActive }}
                   onPress={() => switchMode(mode)}
@@ -1983,7 +3195,7 @@ export default function App() {
                 <Polyline
                   key={`corridor-${i}`}
                   coordinates={c.points}
-                  strokeColor="rgba(255,159,10,0.5)"
+                  strokeColor={MAP_COLORS.busyRoad}
                   strokeWidth={7}
                 />
               ))}
@@ -1993,7 +3205,7 @@ export default function App() {
                     <Polyline
                       key={`alt-${i}`}
                       coordinates={r.points}
-                      strokeColor={altColor(routeLevel(r, scored.length))}
+                      strokeColor={MAP_COLORS.otherRoute}
                       strokeWidth={3}
                       lineDashPattern={[6, 6]}
                     />
@@ -2002,7 +3214,7 @@ export default function App() {
               {shownRoute && (
                 <Polyline
                   coordinates={shownRoute.points}
-                  strokeColor="#007AFF"
+                  strokeColor={MAP_COLORS.selectedRoute}
                   strokeWidth={5}
                 />
               )}
@@ -2010,28 +3222,65 @@ export default function App() {
                 <Marker
                   coordinate={shownRoute.points[0]}
                   title="Start"
-                  pinColor="#34C759"
+                  pinColor={MAP_COLORS.start}
                 />
               )}
               {shownRoute && (
                 <Marker
                   coordinate={shownRoute.points[shownRoute.points.length - 1]}
                   title={selected?.label ?? 'Destination'}
+                  pinColor={MAP_COLORS.destination}
                 />
               )}
-              {mapCrashes.map((c) => (
+              {shownRoute?.unsafeCrossings.map((x, i) => (
                 <Marker
-                  key={`crash-${c.id}`}
-                  coordinate={c.at}
+                  key={`xing-${i}`}
+                  coordinate={x}
                   anchor={{ x: 0.5, y: 0.5 }}
                   tracksViewChanges={false}
-                  onPress={() => setPickedCrash(c)}
+                  title="No crosswalk here"
+                  description="This route crosses a busy road away from a crosswalk or signal."
                 >
-                  <View style={styles.crashHit}>
-                    <View style={[styles.crashDot, { backgroundColor: crashColor(c) }]} />
+                  <View
+                    style={styles.xingMarker}
+                    accessible
+                    accessibilityLabel="Busy-road crossing without a crosswalk"
+                  >
+                    <MaterialIcons name="priority-high" size={14} color="#fff" />
                   </View>
                 </Marker>
               ))}
+              {mapCrashes.map((c) => {
+                const picked = pickedCrash?.id === c.id;
+                return (
+                  <Marker
+                    // Markers don't redraw on their own (tracksViewChanges is
+                    // off for speed), so the key changes when one is picked.
+                    key={`crash-${c.id}${picked ? '-picked' : ''}`}
+                    coordinate={c.at}
+                    anchor={{ x: 0.5, y: 0.5 }}
+                    tracksViewChanges={false}
+                    zIndex={picked ? 10 : 1}
+                    onPress={() => setPickedCrash(c)}
+                  >
+                    <View
+                      style={styles.crashHit}
+                      accessible
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: picked }}
+                      accessibilityLabel={`${crashTitle(c)}. Show details`}
+                    >
+                      <View
+                        style={[
+                          styles.crashDot,
+                          picked && styles.crashDotPicked,
+                          { backgroundColor: crashColor(c) },
+                        ]}
+                      />
+                    </View>
+                  </Marker>
+                );
+              })}
             </MapView>
           )}
 
@@ -2049,7 +3298,12 @@ export default function App() {
                 style={[styles.safetyDot, { backgroundColor: crashColor(pickedCrash) }]}
               />
               <Text style={styles.crashCardTitle}>{crashTitle(pickedCrash)}</Text>
-              <Pressable hitSlop={10} onPress={() => setPickedCrash(null)}>
+              <Pressable
+                hitSlop={10}
+                accessibilityRole="button"
+                accessibilityLabel="Close crash details"
+                onPress={() => setPickedCrash(null)}
+              >
                 <MaterialIcons name="close" size={20} color="#8E8E93" />
               </Pressable>
             </View>
@@ -2089,8 +3343,9 @@ export default function App() {
                 setWeather(null);
                 setAddress(text);
               }}
-              placeholder="enter address here"
+              placeholder="Where are you going?"
               placeholderTextColor="#8E8E93"
+              accessibilityLabel="Destination address"
               autoCorrect={false}
               autoCapitalize="words"
               returnKeyType="search"
@@ -2114,6 +3369,7 @@ export default function App() {
                 <Pressable
                   key={item.id}
                   style={styles.suggestionRow}
+                  accessibilityRole="button"
                   onPress={() => handleSelect(item)}
                 >
                   <Text style={styles.suggestionText}>{item.label}</Text>
@@ -2125,6 +3381,8 @@ export default function App() {
           <View style={styles.modeRow}>
             <Pressable
               disabled={!canRoute}
+              accessibilityRole="button"
+              accessibilityState={{ disabled: !canRoute }}
               style={({ pressed }) => [
                 styles.modeButton,
                 canRoute ? styles.modeButtonActive : styles.modeButtonDisabled,
@@ -2144,7 +3402,7 @@ export default function App() {
                     !canRoute && styles.modeButtonTextDisabled,
                   ]}
                 >
-                  {ranksRoutes ? 'Find safe route' : 'Check for safety corridors'}
+                  {ranksRoutes ? 'Find safe route' : 'Check route safety'}
                 </Text>
               </View>
             </Pressable>
@@ -2159,194 +3417,155 @@ export default function App() {
           )}
         </View>
 
-        <View style={styles.legendRow}>
-          <View style={styles.legendItem}>
-            <View style={[styles.safetyDot, { backgroundColor: '#FF3B30' }]} />
-            <Text style={styles.legendText}>High risk</Text>
-          </View>
-          <View style={styles.legendItem}>
-            <View style={[styles.safetyDot, { backgroundColor: '#FF9500' }]} />
-            <Text style={styles.legendText}>Medium risk</Text>
-          </View>
-          <View style={styles.legendItem}>
-            <View style={[styles.safetyDot, { backgroundColor: '#34C759' }]} />
-            <Text style={styles.legendText}>Low risk</Text>
-          </View>
-        </View>
-        <Text style={styles.legendNote}>
-          {mapCrashes.length >= MAP_CRASH_LIMIT
-            ? `Showing the ${MAP_CRASH_LIMIT} most recent crashes in view. Zoom in to see more. `
-            : ''}
-          Showing {CRASH_NOUN[travelMode]} crashes only. Tap a dot for details. City
-          of San José crash data, last five years.
-        </Text>
-
-        <View style={styles.controls}>
-          {selected && !shownRoute && (
-            <Text style={styles.coords}>
-              {selected.latitude.toFixed(5)}, {selected.longitude.toFixed(5)}
-            </Text>
-          )}
-
+        <View style={styles.results}>
           {ranksRoutes && scored.length > 0 && (
-            <View style={styles.routeChips}>
+            <>
+              <SectionTitle>Your options</SectionTitle>
               {scored.map((r, i) => (
-                <Pressable
-                  key={`route-${i}`}
-                  style={[
-                    styles.routeChip,
-                    i === activeIdx && styles.routeChipActive,
-                  ]}
+                <RouteOptionCard
+                  key={r.role ?? i}
+                  route={r}
+                  selected={i === activeIdx}
+                  sameAsFastest={isSameRoute(scored[0], scored[1])}
+                  crashDataFailed={crashDataFailed}
                   onPress={() => setActiveIdx(i)}
-                >
-                  <View style={styles.routeChipTop}>
-                    <View
-                      style={[
-                        styles.safetyDot,
-                        { backgroundColor: safetyColor(routeLevel(r, scored.length)) },
-                      ]}
-                    />
-                    <Text style={styles.routeChipText}>
-                      {routeName(r, scored.length)} ·{' '}
-                      {formatDuration(r.seconds)} · {formatDistance(r.meters)}
-                    </Text>
-                  </View>
-                  <Text style={styles.routeChipSub}>
-                    {Math.round(r.corridorRatio * 100)}% on busy main roads
-                    {r.crashCount
-                      ? ` · ${crashCountText(r.crashCount, travelMode)} nearby${
-                          r.highRiskCount ? ` (${r.highRiskCount} high risk)` : ''
-                        }`
-                      : ''}
-                  </Text>
-                </Pressable>
+                />
               ))}
-            </View>
+            </>
           )}
-        </View>
 
-        {ranksRoutes && active && (
-          <View style={styles.mapSection}>
-            <Text style={styles.routeMeta}>
-              {formatDistance(active.meters)} ·{' '}
-              {formatDuration(active.seconds)} {travelMode === 'bike' ? 'ride' : 'walk'}
-            </Text>
-
-            {weather && (
-              <Text style={styles.weatherText}>
-                {weather.tempF}°F · {weather.description}
-              </Text>
-            )}
-
-            <Pressable
-              style={({ pressed }) => [
-                styles.gmapsButton,
-                styles.startButton,
-                pressed && styles.modeButtonPressed,
-              ]}
-              onPress={() => setNavigating(true)}
-            >
-              <View style={styles.modeButtonContent}>
-                <MaterialIcons name="navigation" size={22} color="#fff" />
-                <Text style={styles.gmapsButtonText}>Start navigation</Text>
-              </View>
-            </Pressable>
-            <Text style={styles.gmapsHint}>
-              Turn-by-turn voice directions along this exact route.
-            </Text>
-
-            <View style={styles.safetyBox}>
-              {outOfArea ? (
-                <Text style={styles.safetyMuted}>
-                  No San José street data along this route.
-                </Text>
-              ) : (
-                <>
-                  <View style={styles.safetyRow}>
-                    <View
-                      style={[
-                        styles.safetyDot,
-                        { backgroundColor: safetyColor(routeLevel(active, scored.length)) },
-                      ]}
-                    />
-                    <Text style={styles.safetyText}>
-                      {active.corridorMeters >= 30
-                        ? `Uses busy main roads for ${formatDistance(
-                            active.corridorMeters,
-                          )} (${Math.round(active.corridorRatio * 100)}%)`
-                        : 'Mostly on calmer streets'}
-                    </Text>
-                  </View>
-                  <Text style={styles.safetyText}>
-                    {active.crashCount === 0
-                      ? `No reported ${CRASH_NOUN[travelMode]} crashes along this route`
-                      : `${crashCountText(active.crashCount, travelMode)} within ${formatDistance(
-                          NEAR_CRASH_M,
-                        )}` +
-                        (active.highRiskCount > 0
-                          ? `, ${active.highRiskCount} high risk`
-                          : '') +
-                        ' (City of San José data)'}
+          {ranksRoutes && active && (
+            <>
+              <Pressable
+                style={({ pressed }) => [
+                  styles.gmapsButton,
+                  styles.startButton,
+                  pressed && styles.modeButtonPressed,
+                ]}
+                accessibilityRole="button"
+                onPress={() => setNavigating(true)}
+              >
+                <View style={styles.modeButtonContent}>
+                  <MaterialIcons name="navigation" size={22} color="#fff" />
+                  <Text style={styles.gmapsButtonText}>
+                    Start navigation · {routeName(active)}
                   </Text>
-                </>
+                </View>
+              </Pressable>
+              <Text style={styles.gmapsHint}>
+                Turn-by-turn voice directions along this exact route.
+              </Text>
+
+              <SectionTitle>About this route</SectionTitle>
+              {warningCallouts}
+              {whyThisRoute && (
+                <Callout icon="lightbulb-outline" tone="info">
+                  {whyThisRoute}
+                </Callout>
               )}
-              <Text style={styles.safetyMuted}>
-                Blue = this route · dashed = other options · amber line = busy
-                main road · City of San José data
-              </Text>
-            </View>
-          </View>
-        )}
+              {darkCallout}
+              <Card>
+                <DetailsHeader
+                  title={`${routeName(active)} route`}
+                  meters={active.meters}
+                  seconds={active.seconds}
+                  verb={travelMode === 'bike' ? 'ride' : 'walk'}
+                  weather={weather}
+                />
+                {outOfArea ? (
+                  <Text style={styles.cardBodyText}>
+                    This route is outside San Jose city limits. The city has no
+                    crash records there, so this app can't rate it.
+                  </Text>
+                ) : (
+                  <>
+                    <FactRow
+                      icon="traffic"
+                      label="Busy main roads"
+                      value={busyRoadsValue(active)}
+                      tone={active.corridorMeters > 0 ? 'warn' : 'good'}
+                    />
+                    <FactRow
+                      icon="report-problem"
+                      label={`Past ${CRASH_NOUN[travelMode]} crashes`}
+                      value={crashesValue(active)}
+                      tone={crashDataFailed ? 'neutral' : active.crashCount ? 'warn' : 'good'}
+                      last={!active.crossingsChecked}
+                    />
+                    {active.crossingsChecked && (
+                      <FactRow
+                        icon="directions-walk"
+                        label="Busy-road crossings"
+                        value={
+                          active.unsafeCrossings.length === 0
+                            ? 'All at crosswalks'
+                            : `${active.unsafeCrossings.length} without a crosswalk`
+                        }
+                        tone={active.unsafeCrossings.length ? 'warn' : 'good'}
+                        last
+                      />
+                    )}
+                  </>
+                )}
+              </Card>
+            </>
+          )}
 
-        {travelMode === 'drive' && driveResult && (
-          <View style={styles.mapSection}>
-            <Text style={styles.routeMeta}>
-              {formatDistance(driveResult.meters)} ·{' '}
-              {formatDuration(driveResult.seconds)} drive
-            </Text>
-
-            <View style={styles.safetyBox}>
-              {driveResult.corridorMeters > 0 ? (
-                <Text style={styles.cautionText}>
-                  ⚠️ Caution: your route overlaps with a Vision Zero safety
-                  corridor for {formatDistance(driveResult.corridorMeters)} (
-                  {Math.round(driveResult.corridorRatio * 100)}% of the drive).
-                </Text>
-              ) : (
-                <Text style={styles.safetyText}>
-                  No Vision Zero safety corridors along this route.
-                </Text>
-              )}
-              <Text style={styles.safetyText}>
-                {driveResult.crashCount === 0
-                  ? 'No reported car crashes along this route'
-                  : `${crashCountText(driveResult.crashCount, 'drive')} within ${formatDistance(
-                      NEAR_CRASH_M,
-                    )}` +
-                    (driveResult.highRiskCount > 0
-                      ? `, ${driveResult.highRiskCount} high risk`
-                      : '')}
+          {travelMode === 'drive' && driveResult && (
+            <>
+              <SectionTitle>Your drive</SectionTitle>
+              {warningCallouts}
+              {darkCallout}
+              <Card>
+                <DetailsHeader
+                  title="Default driving route"
+                  meters={driveResult.meters}
+                  seconds={driveResult.seconds}
+                  verb="drive"
+                  weather={weather}
+                />
+                <FactRow
+                  icon="traffic"
+                  label="Vision Zero corridors"
+                  value={busyRoadsValue(driveResult)}
+                  tone={driveResult.corridorMeters > 0 ? 'warn' : 'good'}
+                />
+                <FactRow
+                  icon="report-problem"
+                  label="Past car crashes"
+                  value={crashesValue(driveResult)}
+                  tone={crashDataFailed ? 'neutral' : driveResult.crashCount ? 'warn' : 'good'}
+                  last
+                />
+              </Card>
+              <Pressable
+                style={({ pressed }) => [styles.gmapsButton, pressed && styles.modeButtonPressed]}
+                accessibilityRole="button"
+                onPress={() => openInGoogleMaps(driveResult, 'driving')}
+              >
+                <Text style={styles.gmapsButtonText}>Open in Google Maps</Text>
+              </Pressable>
+              <Text style={styles.gmapsHint}>
+                Opens Google's own default driving route for turn-by-turn
+                navigation.
               </Text>
-              <Text style={styles.safetyMuted}>
-                City of San José Vision Zero and crash data.
-              </Text>
-            </View>
+            </>
+          )}
 
-            <Pressable
-              style={({ pressed }) => [
-                styles.gmapsButton,
-                pressed && styles.modeButtonPressed,
-              ]}
-              onPress={() => openInGoogleMaps(driveResult, 'driving')}
-            >
-              <Text style={styles.gmapsButtonText}>Open in Google Maps</Text>
-            </Pressable>
-            <Text style={styles.gmapsHint}>
-              Opens Google's own default driving route for turn-by-turn
-              navigation.
-            </Text>
-          </View>
-        )}
+          <SectionTitle>Map key</SectionTitle>
+          <MapKey
+            crashNoun={CRASH_NOUN[travelMode]}
+            showCrossings={travelMode === 'walk'}
+            note={
+              'Crash dots appear when you zoom in; tap one for details. ' +
+              (mapCrashes.length >= MAP_CRASH_LIMIT
+                ? `Only the ${MAP_CRASH_LIMIT} most recent in view are shown, so zoom in further to see all. `
+                : '') +
+              'Crashes from the last five years and busy roads: City of San Jose. ' +
+              (travelMode === 'walk' ? 'Crosswalks: OpenStreetMap.' : '')
+            }
+          />
+        </View>
       </ScrollView>
       <StatusBar style="auto" />
     </View>
@@ -2364,29 +3583,64 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
   },
   searchBar: {
-    paddingTop: TOP_INSET + 8,
+    paddingTop: TOP_INSET + 4,
     paddingHorizontal: 16,
-    paddingBottom: 12,
+    paddingBottom: 16,
   },
   greeting: {
+    flex: 1,
     fontSize: 26,
-    lineHeight: 34,
-    color: '#000',
-    marginBottom: 28,
+    lineHeight: 32,
+    color: '#1C1C1E',
     fontFamily: HEADING_FONT,
-    letterSpacing: -0.3,
+    letterSpacing: -0.4,
+  },
+  titleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  logoBadge: {
+    width: 40,
+    height: 40,
+    borderRadius: 11,
+    backgroundColor: '#1A73F0',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  greetingCity: {
+    color: '#1A73F0',
+  },
+  headerDivider: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: '#D1D1D6',
+    marginTop: 18,
+    marginBottom: 4,
+  },
+  tagline: {
+    marginTop: 12,
+    fontSize: 15,
+    lineHeight: 22,
+    color: '#6C6C70',
+    fontFamily: FONT.regular,
   },
   tabRow: {
     flexDirection: 'row',
-    marginBottom: 16,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: '#D1D1D6',
   },
   tabButton: {
     flex: 1,
     alignItems: 'center',
-    paddingTop: 6,
+    paddingTop: 10,
+  },
+  // A thin line between tabs.
+  tabButtonDivided: {
+    borderLeftWidth: StyleSheet.hairlineWidth,
+    borderLeftColor: '#E5E5EA',
   },
   tabButtonText: {
-    marginTop: 2,
+    marginTop: 3,
     fontSize: 13,
     fontFamily: FONT.medium,
     color: '#8E8E93',
@@ -2397,10 +3651,12 @@ const styles = StyleSheet.create({
   },
   // Reserves the indicator's space on both tabs so switching doesn't shift layout.
   tabIndicator: {
-    marginTop: 6,
-    width: 24,
+    marginTop: 10,
+    alignSelf: 'stretch',
+    marginHorizontal: 12,
     height: 3,
-    borderRadius: 2,
+    borderTopLeftRadius: 3,
+    borderTopRightRadius: 3,
     backgroundColor: 'transparent',
   },
   tabIndicatorActive: {
@@ -2412,7 +3668,7 @@ const styles = StyleSheet.create({
   },
   input: {
     flex: 1,
-    height: 44,
+    minHeight: 44,
     borderWidth: 1,
     borderColor: '#D1D1D6',
     borderRadius: 10,
@@ -2421,9 +3677,6 @@ const styles = StyleSheet.create({
     fontFamily: FONT.regular,
     backgroundColor: '#F2F2F7',
     color: '#000',
-  },
-  controls: {
-    paddingHorizontal: 16,
   },
   modeRow: {
     flexDirection: 'row',
@@ -2436,14 +3689,14 @@ const styles = StyleSheet.create({
   },
   modeButton: {
     flex: 1,
-    height: 44,
+    minHeight: 44,
     borderRadius: 10,
     backgroundColor: '#8E8E93',
     alignItems: 'center',
     justifyContent: 'center',
   },
   modeButtonActive: {
-    backgroundColor: '#007AFF',
+    backgroundColor: '#3A3A3C',
   },
   modeButtonDisabled: {
     backgroundColor: '#E5E5EA',
@@ -2498,53 +3751,27 @@ const styles = StyleSheet.create({
     fontFamily: FONT.regular,
     color: '#000',
   },
-  coords: {
-    marginTop: 8,
-    fontSize: 13,
-    fontFamily: FONT.regular,
-    color: '#8E8E93',
-  },
-  routeChips: {
-    flexDirection: 'column',
-    gap: 8,
-    marginTop: 28,
-  },
-  routeChip: {
-    width: '100%',
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#D1D1D6',
-    backgroundColor: '#fff',
-  },
-  routeChipActive: {
-    borderColor: '#007AFF',
-    backgroundColor: '#EAF3FF',
-  },
-  routeChipTop: {
-    flexDirection: 'row',
+  xingMarker: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: MAP_COLORS.noCrosswalk,
+    borderWidth: 2,
+    borderColor: '#fff',
     alignItems: 'center',
+    justifyContent: 'center',
   },
-  routeChipText: {
-    fontSize: 17,
-    fontFamily: FONT.bold,
-    color: '#000',
+  results: {
+    paddingHorizontal: 16,
   },
-  routeChipSub: {
-    marginTop: 4,
-    fontSize: 13,
+  cardBodyText: {
+    fontSize: 14,
+    lineHeight: 20,
+    color: '#3A3A3C',
     fontFamily: FONT.regular,
-    color: '#8E8E93',
   },
   scrollBody: {
     paddingBottom: 32,
-  },
-  mapSection: {
-    marginTop: 8,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: '#E5E5EA',
-    paddingTop: 12,
   },
   mapWrap: {
     marginHorizontal: 16,
@@ -2581,6 +3808,15 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: '#fff',
   },
+  // The crash whose details are showing: larger, with a blue ring no crash
+  // color uses.
+  crashDotPicked: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 4,
+    borderColor: MAP_COLORS.crashPicked,
+  },
   crashCard: {
     marginHorizontal: 16,
     marginTop: 10,
@@ -2613,83 +3849,15 @@ const styles = StyleSheet.create({
     fontFamily: FONT.regular,
     color: '#000',
   },
-  legendRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    columnGap: 14,
-    rowGap: 4,
-    paddingHorizontal: 16,
-    marginTop: 10,
-  },
-  legendItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  legendText: {
-    fontSize: 12,
-    fontFamily: FONT.regular,
-    color: '#000',
-  },
-  legendNote: {
-    paddingHorizontal: 16,
-    marginTop: 4,
-    fontSize: 11,
-    fontFamily: FONT.regular,
-    color: '#8E8E93',
-  },
-  routeMeta: {
-    paddingHorizontal: 16,
-    paddingTop: 10,
-    fontSize: 14,
-    fontFamily: FONT.semibold,
-    color: '#000',
-    backgroundColor: '#fff',
-  },
-  weatherText: {
-    paddingHorizontal: 16,
-    paddingTop: 4,
-    fontSize: 13,
-    fontFamily: FONT.regular,
-    color: '#8E8E93',
-    backgroundColor: '#fff',
-  },
-  safetyBox: {
-    paddingHorizontal: 16,
-    paddingTop: 6,
-    paddingBottom: 10,
-    backgroundColor: '#fff',
-  },
-  safetyRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
   safetyDot: {
     width: 10,
     height: 10,
     borderRadius: 5,
     marginRight: 8,
   },
-  safetyText: {
-    flex: 1,
-    fontSize: 13,
-    fontFamily: FONT.regular,
-    color: '#000',
-  },
-  cautionText: {
-    fontSize: 14,
-    fontFamily: FONT.bold,
-    color: '#B4270E',
-  },
-  safetyMuted: {
-    marginTop: 4,
-    fontSize: 11,
-    fontFamily: FONT.regular,
-    color: '#8E8E93',
-  },
   gmapsButton: {
-    marginHorizontal: 16,
     marginTop: 14,
-    height: 52,
+    minHeight: 52,
     borderRadius: 12,
     backgroundColor: '#1A73E8',
     alignItems: 'center',
@@ -2701,8 +3869,8 @@ const styles = StyleSheet.create({
     fontFamily: FONT.bold,
   },
   gmapsHint: {
-    marginHorizontal: 16,
     marginTop: 6,
+    textAlign: 'center',
     fontSize: 12,
     fontFamily: FONT.regular,
     color: '#8E8E93',
@@ -2753,13 +3921,49 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 0,
   },
+  navControlsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-end',
+    paddingHorizontal: 16,
+    marginBottom: 12,
+  },
+  navMapButtons: {
+    gap: 10,
+  },
+  navMapButton: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3,
+  },
+  // North up is on.
+  navMapButtonOn: {
+    borderWidth: 2,
+    borderColor: '#007AFF',
+  },
+  navMapButtonText: {
+    fontSize: 15,
+    color: '#1C1C1E',
+    fontFamily: FONT.bold,
+  },
+  compassN: {
+    fontSize: 9,
+    lineHeight: 10,
+    color: '#FF3B30',
+    fontFamily: FONT.bold,
+  },
   navRecenter: {
-    alignSelf: 'flex-start',
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
-    marginLeft: 16,
-    marginBottom: 12,
     paddingVertical: 10,
     paddingHorizontal: 14,
     borderRadius: 22,
@@ -2814,7 +4018,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#F2F2F7',
   },
   navEndButton: {
-    height: 44,
+    minHeight: 44,
     paddingHorizontal: 22,
     borderRadius: 22,
     alignItems: 'center',
