@@ -546,6 +546,23 @@ async function fetchOsrm(url: string, retries: number): Promise<any> {
   }
 }
 
+// Runs fn over items with at most `limit` running at once, results in order.
+// The public routing server rate-limits bursts: a dozen requests at once
+// gets HTTP 429, and a few such bursts get the connection refused for a
+// while, which then fails the next search too.
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
 // Ask OSRM for one or more routes, each with per-maneuver steps, so we can
 // both rank them for safety and show turn-by-turn directions. Walk and Bike
 // ask for alternatives to rank; Drive just needs the one default route to
@@ -1146,6 +1163,25 @@ function findCrossings(pts: LatLng[], index: CrossingIndex): RoadCrossing[] {
   return out;
 }
 
+// Whether walking straight from a to b would cross a major road.
+function crossesMajorRoad(a: LatLng, b: LatLng, index: CrossingIndex): boolean {
+  const A = toXY(a);
+  const B = toXY(b);
+  const r = sub(B, A);
+  for (const cell of cellsAround(A, B, 0)) {
+    for (const [C, D] of index.segs.get(cell) ?? []) {
+      const s = sub(D, C);
+      const denom = cross(r, s);
+      if (Math.abs(denom) < 1e-9) continue; // parallel
+      const CA = sub(C, A);
+      const t = cross(CA, s) / denom;
+      const u = cross(CA, r) / denom;
+      if (t >= 0 && t <= 1 && u >= 0 && u <= 1) return true;
+    }
+  }
+  return false;
+}
+
 // The closest crosswalk or signal to an unsafe crossing, to route through
 // instead. Null if there's none within reach.
 function crosswalkNear(p: LatLng, index: CrossingIndex, maxM = 300): LatLng | null {
@@ -1208,7 +1244,9 @@ function onAnyCorridor(p: LatLng, corridors: Corridor[]): boolean {
 // shop on a busy street is often that street's sidewalk, even when a parking
 // lot or footway behind it leads in from a quiet side street. These are the
 // other paths near the destination that aren't on a busy road, to route to as
-// well; scoring then picks the better way in.
+// well; scoring then picks the better way in. A path across a major road from
+// the destination isn't a way in: the route would end there and leave the
+// last stretch as an unmarked crossing the route never shows.
 const ENTRANCE_MAX_M = 60;
 const ENTRANCE_TRIES = 2;
 
@@ -1219,6 +1257,7 @@ async function quietEntrances(
 ): Promise<LatLng[]> {
   const url = OSRM_URL[mode].replace('/route/v1/', '/nearest/v1/');
   const json = await fetchOsrm(`${url}/${dest.longitude},${dest.latitude}?number=8`, 0);
+  const roads = bundledCrossingIndex();
   const out: LatLng[] = [];
   // The first waypoint is where OSRM's own route already ends.
   for (const w of ((json.waypoints ?? []) as any[]).slice(1)) {
@@ -1226,6 +1265,7 @@ async function quietEntrances(
     if (typeof lat !== 'number' || typeof lon !== 'number') continue;
     const p: LatLng = { latitude: lat, longitude: lon };
     if (segMeters(p, dest) > ENTRANCE_MAX_M || onAnyCorridor(p, corridors)) continue;
+    if (roads && crossesMajorRoad(p, dest, roads)) continue;
     if (out.some((q) => segMeters(q, p) < 15)) continue;
     out.push(p);
     if (out.length >= ENTRANCE_TRIES) break;
@@ -1355,13 +1395,21 @@ function isSafeEnough(r: ScoredRoute): boolean {
 }
 
 // Safest first. A route that's clear of every hazard always beats one that
-// merely scores lower on the weighted risk formula; equal risk goes to the
+// merely scores lower on the weighted risk formula. Next, fewer busy-road
+// crossings without a crosswalk always wins: walking along a busy road's
+// sidewalk is safer than crossing it mid-block, so no amount of avoided
+// busy road makes up for an unmarked crossing. Equal risk goes to the
 // shorter route, so the order is never a tie.
 function compareSafety(a: ScoredRoute, b: ScoredRoute): number {
   const aClear = isRouteClear(a) ? 0 : 1;
   const bClear = isRouteClear(b) ? 0 : 1;
   if (aClear !== bClear) return aClear - bClear;
-  return a.riskScore - b.riskScore || a.meters - b.meters || a.seconds - b.seconds;
+  return (
+    a.unsafeCrossings.length - b.unsafeCrossings.length ||
+    a.riskScore - b.riskScore ||
+    a.meters - b.meters ||
+    a.seconds - b.seconds
+  );
 }
 
 function pickSafest(pool: ScoredRoute[]): ScoredRoute {
@@ -1399,6 +1447,12 @@ const DETOUR_MAX_EXTRA_S = 25 * 60;
 // stops early once the safest route has no danger spots left.
 const DETOUR_ROUNDS = 3;
 const DETOUR_SPOTS = 3;
+// Detour requests sent to the routing server at once (see mapLimit), and in
+// total per search. The server refuses connections after roughly a dozen
+// requests in half a minute, and a search already makes about four before
+// detours, so the detour search has to fit in what's left.
+const DETOUR_CONCURRENCY = 2;
+const DETOUR_MAX_REQUESTS = 8;
 // Danger spots closer together than this are treated as one.
 const SPOT_MERGE_M = 150;
 
@@ -1494,20 +1548,25 @@ function sameRoute(a: Route, b: Route): boolean {
 }
 
 // The two options are named for what they're for, and colored to match:
-// green (or a warning color) for the safest route, grey for the fastest. A safest route that isn't
-// safe enough is only safer.
+// green (or a warning color) for the safest route, grey (or red) for the fastest. A safest route that isn't
+// safe enough is only a safer alternative.
 function routeName(r: ScoredRoute): string {
   if (r.role !== 'safest') return 'Fastest';
-  return isSafeEnough(r) ? 'Safest' : 'Safer';
+  return isSafeEnough(r) ? 'Safest' : 'Safer alternative';
 }
 
 // The safest route's dot also shows how safe it is, by the larger of its
 // shares near crash sites and on busy roads: green up to 1%, yellow up to 5%,
-// red beyond.
+// red beyond. The fastest route's dot is red if it runs into any hazard (busy
+// main roads, crash sites or a crossing without a crosswalk), grey otherwise.
 const CAUTION_MAX_SHARE = 0.05;
 
 function routeColor(r: ScoredRoute, alpha = 1): string {
-  if (r.role !== 'safest') return `rgba(142,142,147,${alpha})`;
+  if (r.role !== 'safest') {
+    return remainingHazards(r).length
+      ? `rgba(255,59,48,${alpha})`
+      : `rgba(142,142,147,${alpha})`;
+  }
   const worst = Math.max(r.crashShare, r.corridorRatio);
   if (worst <= SAFE_MAX_SHARE) return `rgba(52,199,89,${alpha})`;
   if (worst <= CAUTION_MAX_SHARE) return `rgba(255,204,0,${alpha})`;
@@ -1516,12 +1575,12 @@ function routeColor(r: ScoredRoute, alpha = 1): string {
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
-// What a route still runs into, e.g. ["0.1 mi of busy main roads",
+// What a route still runs into, e.g. ["0.1 mi of high-injury streets",
 // "2 crash sites", "1 busy-road crossing without a crosswalk"]. Empty means
 // it avoids everything checked.
 function remainingHazards(r: ScoredRoute): string[] {
   const out: string[] = [];
-  if (r.corridorMeters > 0) out.push(`${formatDistance(r.corridorMeters)} of busy main roads`);
+  if (r.corridorMeters > 0) out.push(`${formatDistance(r.corridorMeters)} of high-injury streets`);
   if (r.crashCount > 0) out.push(plural(r.crashCount, 'crash site'));
   if (r.unsafeCrossings.length > 0) {
     out.push(plural(r.unsafeCrossings.length, 'busy-road crossing') + ' without a crosswalk');
@@ -1533,8 +1592,8 @@ function remainingHazards(r: ScoredRoute): string[] {
 function safestSummary(r: ScoredRoute): string {
   const left = remainingHazards(r);
   const avoided = r.crossingsChecked
-    ? 'busy main roads, crash sites and crossings without a crosswalk'
-    : 'busy main roads and crash sites';
+    ? 'high-injury streets, crash sites and crossings without a crosswalk'
+    : 'high-injury streets and crash sites';
   if (!left.length) return `Avoids all ${avoided}.`;
   return `No route within reach avoids everything. Still passes ${joinAnd(left)}.`;
 }
@@ -1543,7 +1602,7 @@ function safestSummary(r: ScoredRoute): string {
 
 // One sentence comparing the shown route with another option, e.g. "Compared
 // with the fastest route, this one passes 4 fewer past pedestrian crashes
-// and 0.3 mi less of busy main roads, and takes 3 min longer."
+// and 0.3 mi less of high-injury streets, and takes 3 min longer."
 function comparePhrase(r: ScoredRoute, other: ScoredRoute, mode: TravelMode): string[] {
   const parts: string[] = [];
   const crashDiff = other.crashCount - r.crashCount;
@@ -1554,7 +1613,7 @@ function comparePhrase(r: ScoredRoute, other: ScoredRoute, mode: TravelMode): st
   }
   const roadDiff = other.corridorMeters - r.corridorMeters;
   if (Math.abs(roadDiff) >= 50) {
-    parts.push(`${formatDistance(Math.abs(roadDiff))} ${roadDiff > 0 ? 'less' : 'more'} of busy main roads`);
+    parts.push(`${formatDistance(Math.abs(roadDiff))} ${roadDiff > 0 ? 'less' : 'more'} of high-injury streets`);
   }
   const xDiff = other.unsafeCrossings.length - r.unsafeCrossings.length;
   if (xDiff !== 0) {
@@ -2056,11 +2115,12 @@ function NavigationView({
 // The results under the map, laid out as cards: the two route options, a
 // details card for the selected route, and a map key.
 
-type Tone = 'good' | 'warn' | 'neutral';
+type Tone = 'good' | 'warn' | 'danger' | 'neutral';
 
 const TONE_COLOR: Record<Tone, string> = {
   good: '#1E8E3E',
   warn: '#B25000',
+  danger: '#C9182B',
   neutral: '#3A3A3C',
 };
 
@@ -2075,11 +2135,17 @@ function SectionTitle({ children }: { children: string }) {
 }
 
 // One small figure in a route card, e.g. "8%" over "Crash sites".
+// A danger stat is tinted red with a warning icon, so the riskiest thing on a
+// route stands out from the ordinary warnings beside it.
 function Stat({ value, label, tone }: { value: string; label: string; tone: Tone }) {
+  const danger = tone === 'danger';
   return (
-    <View style={cardStyles.stat}>
-      <Text style={[cardStyles.statValue, { color: TONE_COLOR[tone] }]}>{value}</Text>
-      <Text style={cardStyles.statLabel}>{label}</Text>
+    <View style={[cardStyles.stat, danger && cardStyles.statDanger]}>
+      <View style={cardStyles.statValueRow}>
+        {danger && <MaterialIcons name="warning" size={15} color={TONE_COLOR.danger} />}
+        <Text style={[cardStyles.statValue, { color: TONE_COLOR[tone] }]}>{value}</Text>
+      </View>
+      <Text style={[cardStyles.statLabel, danger && { color: TONE_COLOR.danger }]}>{label}</Text>
     </View>
   );
 }
@@ -2114,9 +2180,6 @@ function RouteOptionCard({
         <View style={cardStyles.optionTitleWrap}>
           <Text style={cardStyles.optionTitle}>
             {safeEnough && sameAsFastest ? 'Safest and fastest' : routeName(route)}
-            {safest && !safeEnough && (
-              <Text style={cardStyles.optionCaution}> (use caution)</Text>
-            )}
           </Text>
         </View>
         <View style={cardStyles.optionTime}>
@@ -2133,19 +2196,19 @@ function RouteOptionCard({
         />
         <Stat
           value={pct(route.corridorRatio)}
-          label="On busy roads"
+          label="High-injury streets"
           tone={route.corridorMeters > 0 ? 'warn' : 'good'}
         />
         {route.crossingsChecked && (
           <Stat
             value={unsafe === 0 ? 'All safe' : `${unsafe}`}
             label={unsafe === 0 ? 'Crossings' : `No crosswalk`}
-            tone={unsafe === 0 ? 'good' : 'warn'}
+            tone={unsafe === 0 ? 'good' : 'danger'}
           />
         )}
       </View>
 
-      {safest && !crashDataFailed && (
+      {safeEnough && !crashDataFailed && (
         <View style={cardStyles.summaryRow}>
           <MaterialIcons
             name={left ? 'error-outline' : 'check-circle'}
@@ -2162,18 +2225,13 @@ function RouteOptionCard({
 }
 
 // Shown above the options when even the safest route isn't safe enough.
-function NoSafeRouteBanner({ route }: { route: ScoredRoute }) {
-  const share = (x: number) => `${(x * 100).toFixed(x < 0.1 ? 1 : 0)}%`;
-  const over: string[] = [];
-  if (route.crashShare > SAFE_MAX_SHARE) over.push(`${share(route.crashShare)} near crash sites`);
-  if (route.corridorRatio > SAFE_MAX_SHARE) over.push(`${share(route.corridorRatio)} on busy roads`);
+function NoSafeRouteBanner() {
   return (
     <View style={cardStyles.noSafeBanner} accessibilityRole="alert">
-      <MaterialIcons name="warning" size={22} color="#1C1C1E" />
+      <MaterialIcons name="warning" size={22} color="#8A4B00" />
       <View style={{ flex: 1 }}>
-        <Text style={cardStyles.noSafeTitle}>No safe route found</Text>
-        <Text style={cardStyles.noSafeText}>
-          Even the safer route runs {joinAnd(over)}. Take extra care.
+        <Text style={cardStyles.noSafeTitle}>
+          There are no routes that avoid high-injury streets and past crash sites
         </Text>
       </View>
     </View>
@@ -2326,7 +2384,7 @@ function MapKey({
         />
         <KeyItem
           swatch={<View style={[cardStyles.keyLine, { height: 7, backgroundColor: MAP_COLORS.busyRoad }]} />}
-          label="Busy main road"
+          label="High-injury street"
         />
       </KeyGroup>
 
@@ -2414,11 +2472,6 @@ const cardStyles = StyleSheet.create({
     color: '#1C1C1E',
     fontFamily: FONT.bold,
   },
-  optionCaution: {
-    fontSize: 15,
-    color: '#7A5A00',
-    fontFamily: FONT.semibold,
-  },
   noSafeBanner: {
     flexDirection: 'row',
     alignItems: 'flex-start',
@@ -2426,19 +2479,12 @@ const cardStyles = StyleSheet.create({
     marginBottom: 10,
     padding: 14,
     borderRadius: 14,
-    backgroundColor: '#DAA520',
+    backgroundColor: '#FFF4E5',
   },
   noSafeTitle: {
     fontSize: 16,
-    color: '#1C1C1E',
+    color: '#8A4B00',
     fontFamily: FONT.bold,
-  },
-  noSafeText: {
-    marginTop: 2,
-    fontSize: 14,
-    lineHeight: 19,
-    color: '#1C1C1E',
-    fontFamily: FONT.regular,
   },
   optionTime: {
     alignItems: 'flex-end',
@@ -2465,6 +2511,14 @@ const cardStyles = StyleSheet.create({
     paddingHorizontal: 10,
     borderRadius: 10,
     backgroundColor: '#F2F2F7',
+  },
+  statDanger: {
+    backgroundColor: '#FFEBEC',
+  },
+  statValueRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
   },
   statValue: {
     fontSize: 16,
@@ -2977,26 +3031,47 @@ export default function App() {
         const fastest = Math.min(...routes.map((r) => r.seconds));
         const maxSeconds = Math.min(fastest * DETOUR_MAX_RATIO, fastest + DETOUR_MAX_EXTRA_S);
         let reach = offsetM;
-        for (let round = 0; round < DETOUR_ROUNDS; round++) {
+        let budget = DETOUR_MAX_REQUESTS;
+        for (let round = 0; round < DETOUR_ROUNDS && budget > 0; round++) {
           const best = pickSafest(pool);
           if (isRouteClear(best)) break;
           const tries: LatLng[][] = [];
           if (crossings) {
-            for (const x of best.unsafeCrossings.slice(0, DETOUR_SPOTS)) {
-              const v = crosswalkNear(x, crossings);
-              if (v) tries.push(withVia(best, v));
+            // Unmarked crossings are fixed on the current pick and on the
+            // lowest-risk route that has any: that route ranks below routes
+            // without unmarked crossings, but sent through a crosswalk it may
+            // be the safest of all.
+            const lowestRisk = [...pool].sort((a, b) => a.riskScore - b.riskScore)[0];
+            const bases = lowestRisk !== best && lowestRisk.unsafeCrossings.length
+              ? [best, lowestRisk]
+              : [best];
+            for (const base of bases) {
+              for (const x of base.unsafeCrossings.slice(0, DETOUR_SPOTS)) {
+                const v = crosswalkNear(x, crossings);
+                if (v) tries.push(withVia(base, v));
+              }
             }
           }
           for (const spot of dangerSpots(best).slice(0, DETOUR_SPOTS)) {
             for (const v of sidePoints(spot, best.points, reach)) tries.push(withVia(best, v));
           }
           if (!tries.length) break;
-          const found = await Promise.all(
-            tries.map((via) =>
-              fetchRoutes(origin, dest, GOOGLE_MODE[travelMode], false, via)
-                .then((rs) => (rs[0] ? { ...rs[0], via } : null))
-                .catch(() => null),
-            ),
+          // Crosswalk fixes come first in tries, so they're kept when the
+          // budget runs short.
+          const batch = tries.slice(0, budget);
+          budget -= batch.length;
+          let refused = false;
+          const found = await mapLimit(batch, DETOUR_CONCURRENCY, (via) =>
+            cancelled || refused
+              ? Promise.resolve(null)
+              : fetchRoutes(origin, dest, GOOGLE_MODE[travelMode], false, via)
+                  .then((rs) => (rs[0] ? { ...rs[0], via } : null))
+                  .catch(() => {
+                    // The server is pushing back: stop asking, so the next
+                    // search isn't refused too.
+                    refused = true;
+                    return null;
+                  }),
           );
           if (cancelled) return;
           for (const r of found) {
@@ -3004,6 +3079,7 @@ export default function App() {
             if (pool.some((p) => sameRoute(p, r))) continue;
             pool.push(score(r));
           }
+          if (refused) break;
           if (pickSafest(pool) === best) reach *= 2;
         }
       }
@@ -3181,7 +3257,7 @@ export default function App() {
         crashDataFailed &&
           "Couldn't load the city's crash records, so crashes along this route weren't checked. Try the search again.",
         corridorsFailed &&
-          "Couldn't load the city's map of busy main roads, so they weren't checked.",
+          "Couldn't load the city's map of high-injury streets, so they weren't checked.",
         !outOfArea &&
           shownCityShare < 0.9 &&
           `About ${Math.round((1 - shownCityShare) * 100)}% of this route is outside San Jose city limits. ` +
@@ -3256,7 +3332,7 @@ export default function App() {
           </View>
           <Text style={styles.tagline}>
             Find the safest way to walk, bike or drive to your destination, using
-            San Jose's real crash data.
+            San Jose's real crash data and Vision Zero high-injury streets.
           </Text>
 
           <View style={styles.headerDivider} />
@@ -3545,7 +3621,7 @@ export default function App() {
             <>
               <SectionTitle>Your options</SectionTitle>
               {!isSafeEnough(scored[0]) && (
-                <NoSafeRouteBanner route={scored[0]} />
+                <NoSafeRouteBanner />
               )}
               {scored.map((r, i) => (
                 <RouteOptionCard
@@ -3607,7 +3683,7 @@ export default function App() {
                   <>
                     <FactRow
                       icon="traffic"
-                      label="Busy main roads"
+                      label="High-injury streets"
                       value={busyRoadsValue(active)}
                       tone={active.corridorMeters > 0 ? 'warn' : 'good'}
                     />
@@ -3652,7 +3728,7 @@ export default function App() {
                 />
                 <FactRow
                   icon="traffic"
-                  label="Vision Zero corridors"
+                  label="High-injury streets"
                   value={busyRoadsValue(driveResult)}
                   tone={driveResult.corridorMeters > 0 ? 'warn' : 'good'}
                 />
@@ -3687,7 +3763,7 @@ export default function App() {
               (mapCrashes.length >= MAP_CRASH_LIMIT
                 ? `Only the ${MAP_CRASH_LIMIT} most recent in view are shown, so zoom in further to see all. `
                 : '') +
-              'Crashes from the last five years and busy roads: City of San Jose. ' +
+              'Crashes from the last five years and high-injury streets: City of San Jose. ' +
               (travelMode === 'walk' ? 'Crosswalks: OpenStreetMap.' : '')
             }
           />
