@@ -1636,7 +1636,7 @@ function explainRoute(
   const fastest = all.find((x) => x.role === 'fastest');
   const safest = all.find((x) => x.role === 'safest') ?? all[0];
   if (!fastest) {
-    return 'Good news: the safest route is also the fastest, so it is the only option shown.';
+    return `The ${routeName(safest).toLowerCase()} route is also the fastest, so it is the only option shown.`;
   }
   const other = r.role === 'safest' ? fastest : safest;
   const name = r.role === 'safest' ? 'the fastest route' : 'the safest route';
