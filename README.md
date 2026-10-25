@@ -1,9 +1,9 @@
-# SafeRoutes SJ
+# WalkWise SJ
 
 Find the safest way to walk, bike or drive in San José, using the city's real
 crash data and its Vision Zero high-injury streets.
 
-Map apps pick the fastest route. SafeRoutes SJ also checks each route against
+Map apps pick the fastest route. WalkWise SJ also checks each route against
 five years of San José injury crashes, the city's Vision Zero high-injury
 street network and busy-road crossings without a crosswalk. Then it shows you
 the safest option and what risk is left on it.

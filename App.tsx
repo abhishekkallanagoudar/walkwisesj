@@ -19,6 +19,7 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  type ScrollViewInstance,
   StatusBar as RNStatusBar,
   StyleSheet,
   Text,
@@ -49,7 +50,8 @@ const HEADING_FONT = FONT.bold;
 const MAP_COLORS = {
   selectedRoute: '#007AFF',
   otherRoute: 'rgba(142,142,147,0.85)',
-  busyRoad: 'rgba(255,159,10,0.5)',
+  // Vision Zero priority safety corridors: a wide translucent red band.
+  highRiskZone: 'rgba(215,0,21,0.45)',
   start: '#34C759',
   destination: '#FF3B30',
   // Past crashes, by the worst injury: red, orange, yellow.
@@ -1204,6 +1206,10 @@ const ON_CORRIDOR_M = 25;
 // quieter side wins when there is one.
 const ENDPOINT_GRACE_M = 50;
 
+// Draw every corridor in view only when zoomed in at least this far (degrees
+// of latitude), so a city-wide view isn't flooded with lines.
+const CORRIDOR_MAX_VIEW_DELTA = 0.15;
+
 async function fetchSafetyCorridors(): Promise<Corridor[]> {
   const json = await fetchJson(SAFETY_CORRIDORS_URL);
   const out: Corridor[] = [];
@@ -1380,14 +1386,14 @@ function scoreRoute(
   };
 }
 
-// The goal for the safest route: no busy main roads, no past crashes, and no
+// The goal for the safest route: no high-risk zones, no past crashes, and no
 // busy road crossed without a crosswalk.
 function isRouteClear(r: ScoredRoute): boolean {
   return r.corridorMeters === 0 && r.crashCount === 0 && r.unsafeCrossings.length === 0;
 }
 
 // A route counts as safe only if at most 1% of its length is near past crash
-// sites and at most 1% is on busy main roads.
+// sites and at most 1% is in high-risk zones.
 const SAFE_MAX_SHARE = 0.01;
 
 function isSafeEnough(r: ScoredRoute): boolean {
@@ -1575,12 +1581,12 @@ function routeColor(r: ScoredRoute, alpha = 1): string {
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
-// What a route still runs into, e.g. ["0.1 mi of high-injury streets",
+// What a route still runs into, e.g. ["0.1 mi of high-risk zones",
 // "2 crash sites", "1 busy-road crossing without a crosswalk"]. Empty means
 // it avoids everything checked.
 function remainingHazards(r: ScoredRoute): string[] {
   const out: string[] = [];
-  if (r.corridorMeters > 0) out.push(`${formatDistance(r.corridorMeters)} of high-injury streets`);
+  if (r.corridorMeters > 0) out.push(`${formatDistance(r.corridorMeters)} of high-risk zones`);
   if (r.crashCount > 0) out.push(plural(r.crashCount, 'crash site'));
   if (r.unsafeCrossings.length > 0) {
     out.push(plural(r.unsafeCrossings.length, 'busy-road crossing') + ' without a crosswalk');
@@ -1592,8 +1598,8 @@ function remainingHazards(r: ScoredRoute): string[] {
 function safestSummary(r: ScoredRoute): string {
   const left = remainingHazards(r);
   const avoided = r.crossingsChecked
-    ? 'high-injury streets, crash sites and crossings without a crosswalk'
-    : 'high-injury streets and crash sites';
+    ? 'high-risk zones, crash sites and crossings without a crosswalk'
+    : 'high-risk zones and crash sites';
   if (!left.length) return `Avoids all ${avoided}.`;
   return `No route within reach avoids everything. Still passes ${joinAnd(left)}.`;
 }
@@ -1602,7 +1608,7 @@ function safestSummary(r: ScoredRoute): string {
 
 // One sentence comparing the shown route with another option, e.g. "Compared
 // with the fastest route, this one passes 4 fewer past pedestrian crashes
-// and 0.3 mi less of high-injury streets, and takes 3 min longer."
+// and 0.3 mi less of high-risk zones, and takes 3 min longer."
 function comparePhrase(r: ScoredRoute, other: ScoredRoute, mode: TravelMode): string[] {
   const parts: string[] = [];
   const crashDiff = other.crashCount - r.crashCount;
@@ -1613,7 +1619,7 @@ function comparePhrase(r: ScoredRoute, other: ScoredRoute, mode: TravelMode): st
   }
   const roadDiff = other.corridorMeters - r.corridorMeters;
   if (Math.abs(roadDiff) >= 50) {
-    parts.push(`${formatDistance(Math.abs(roadDiff))} ${roadDiff > 0 ? 'less' : 'more'} of high-injury streets`);
+    parts.push(`${formatDistance(Math.abs(roadDiff))} ${roadDiff > 0 ? 'less' : 'more'} of high-risk zones`);
   }
   const xDiff = other.unsafeCrossings.length - r.unsafeCrossings.length;
   if (xDiff !== 0) {
@@ -2196,7 +2202,7 @@ function RouteOptionCard({
         />
         <Stat
           value={pct(route.corridorRatio)}
-          label="High-injury streets"
+          label="In high-risk zones"
           tone={route.corridorMeters > 0 ? 'warn' : 'good'}
         />
         {route.crossingsChecked && (
@@ -2231,7 +2237,7 @@ function NoSafeRouteBanner() {
       <MaterialIcons name="warning" size={22} color="#8A4B00" />
       <View style={{ flex: 1 }}>
         <Text style={cardStyles.noSafeTitle}>
-          There are no routes that avoid high-injury streets and past crash sites
+          There are no routes that avoid high-risk zones and past crash sites
         </Text>
       </View>
     </View>
@@ -2383,8 +2389,8 @@ function MapKey({
           label="Other option"
         />
         <KeyItem
-          swatch={<View style={[cardStyles.keyLine, { height: 7, backgroundColor: MAP_COLORS.busyRoad }]} />}
-          label="High-injury street"
+          swatch={<View style={[cardStyles.keyLine, { height: 8, backgroundColor: MAP_COLORS.highRiskZone }]} />}
+          label="High-risk unsafe zone"
         />
       </KeyGroup>
 
@@ -2755,7 +2761,7 @@ export default function App() {
   // The address box sits below the map, where the keyboard would cover it.
   // While it's focused, the page scrolls it up to the top of the screen, and
   // bottom padding the height of the keyboard gives the page room to scroll.
-  const scrollRef = useRef<ScrollView>(null);
+  const scrollRef = useRef<ScrollViewInstance>(null);
   const addressY = useRef(0);
   const addressFocused = useRef(false);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
@@ -2810,12 +2816,15 @@ export default function App() {
     setWeather(null);
   }
 
-  // Priority safety corridors near whichever route(s) are showing right now,
-  // for the map overlay — Walk/Bike alternatives, or Drive's single route.
+  // Priority safety corridors for the map overlay: every one in view once
+  // zoomed in to neighborhood level, plus any near the route(s) shown.
   const nearbyCorridors = useMemo(() => {
+    const view = bboxOfRegion(region);
+    const inView = (c: Corridor) =>
+      region.latitudeDelta <= CORRIDOR_MAX_VIEW_DELTA && bboxIntersect(c.bbox, view);
     const routesShown: Route[] =
       ranksRoutes ? scored : driveResult ? [driveResult] : [];
-    if (!routesShown.length) return [];
+    if (!routesShown.length) return corridors.filter(inView);
     const box = routesShown.reduce<BBox>(
       (acc, r) => {
         const b = bboxOf(r.points);
@@ -2828,8 +2837,8 @@ export default function App() {
       },
       [Infinity, Infinity, -Infinity, -Infinity],
     );
-    return corridors.filter((c) => bboxIntersect(c.bbox, box, 0.003));
-  }, [ranksRoutes, scored, driveResult, corridors]);
+    return corridors.filter((c) => inView(c) || bboxIntersect(c.bbox, box, 0.003));
+  }, [region, ranksRoutes, scored, driveResult, corridors]);
 
   // Share of the shown route inside San Jose's city limits. Anything outside
   // has no crash data, so it may look safer than it is.
@@ -2838,9 +2847,12 @@ export default function App() {
     return r && cityLimits.length ? cityShare(r.points, cityLimits) : 1;
   }, [ranksRoutes, active, driveResult, cityLimits]);
 
-  // Ask for location once on mount; it centers the map and biases search
-  // results toward what's nearby.
+  // Ask for location on mount; it centers the map and biases search results
+  // toward what's nearby. After that, keep following the device so the start
+  // of a route is where the user is now, not where they opened the app.
   useEffect(() => {
+    let cancelled = false;
+    let watch: Location.LocationSubscription | null = null;
     (async () => {
       try {
         const { status } = await Location.requestForegroundPermissionsAsync();
@@ -2858,21 +2870,52 @@ export default function App() {
             }),
             new Promise<null>((resolve) => setTimeout(() => resolve(null), 10_000)),
           ]));
-        if (!pos) return;
-        setCoords({ lat: pos.coords.latitude, lon: pos.coords.longitude });
-        setRegion({
-          ...DEFAULT_REGION,
-          latitude: pos.coords.latitude,
-          longitude: pos.coords.longitude,
-        });
+        if (cancelled) return;
+        if (pos) {
+          setCoords({ lat: pos.coords.latitude, lon: pos.coords.longitude });
+          setRegion({
+            ...DEFAULT_REGION,
+            latitude: pos.coords.latitude,
+            longitude: pos.coords.longitude,
+          });
+        }
+        const sub = await Location.watchPositionAsync(
+          { accuracy: Location.Accuracy.Balanced, distanceInterval: 20 },
+          (loc) => setCoords({ lat: loc.coords.latitude, lon: loc.coords.longitude }),
+        );
+        if (cancelled) sub.remove();
+        else watch = sub;
       } catch {
         // No location available; the map stays on San Jose and searches
         // fall back to global ranking.
       } finally {
-        setLocationChecked(true);
+        if (!cancelled) setLocationChecked(true);
       }
     })();
+    return () => {
+      cancelled = true;
+      watch?.remove();
+    };
   }, []);
+
+  // Where a route starts: a fresh GPS fix, so it's right even if the user has
+  // moved since the last update. Falls back to the latest followed position
+  // if the GPS is slow to answer.
+  async function currentOrigin(): Promise<LatLng | null> {
+    try {
+      const pos = await Promise.race([
+        Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
+      ]);
+      if (pos) {
+        setCoords({ lat: pos.coords.latitude, lon: pos.coords.longitude });
+        return { latitude: pos.coords.latitude, longitude: pos.coords.longitude };
+      }
+    } catch {
+      // Fall through to the last known position.
+    }
+    return coords ? { latitude: coords.lat, longitude: coords.lon } : null;
+  }
 
   // Frame the route being shown whenever it changes.
   useEffect(() => {
@@ -3113,11 +3156,6 @@ export default function App() {
     if (!query) return;
     if (corridorsFailed) loadCorridors();
 
-    if (!coords) {
-      Alert.alert('Enable location access to get directions.');
-      return;
-    }
-
     setLoading(true);
     try {
       const dest = await resolveDestination(query);
@@ -3126,10 +3164,11 @@ export default function App() {
         return;
       }
       setSuggestions([]);
-      const origin = {
-        latitude: coords.lat,
-        longitude: coords.lon,
-      };
+      const origin = await currentOrigin();
+      if (!origin) {
+        Alert.alert('Could not find your current location. Check that location access is on.');
+        return;
+      }
       const destination = { latitude: dest.latitude, longitude: dest.longitude };
       const midpoint = {
         latitude: (origin.latitude + destination.latitude) / 2,
@@ -3183,11 +3222,6 @@ export default function App() {
     if (!query) return;
     if (corridorsFailed) loadCorridors();
 
-    if (!coords) {
-      Alert.alert('Enable location access to check the route.');
-      return;
-    }
-
     setLoading(true);
     try {
       const dest = await resolveDestination(query);
@@ -3196,7 +3230,11 @@ export default function App() {
         return;
       }
       setSuggestions([]);
-      const origin = { latitude: coords.lat, longitude: coords.lon };
+      const origin = await currentOrigin();
+      if (!origin) {
+        Alert.alert('Could not find your current location. Check that location access is on.');
+        return;
+      }
       const destination = { latitude: dest.latitude, longitude: dest.longitude };
       const found = await fetchRoutes(origin, destination, 'driving', false, [], 2);
       if (!found.length) {
@@ -3257,7 +3295,7 @@ export default function App() {
         crashDataFailed &&
           "Couldn't load the city's crash records, so crashes along this route weren't checked. Try the search again.",
         corridorsFailed &&
-          "Couldn't load the city's map of high-injury streets, so they weren't checked.",
+          "Couldn't load the city's map of high-risk zones, so they weren't checked.",
         !outOfArea &&
           shownCityShare < 0.9 &&
           `About ${Math.round((1 - shownCityShare) * 100)}% of this route is outside San Jose city limits. ` +
@@ -3327,7 +3365,7 @@ export default function App() {
               <MaterialIcons name="alt-route" size={22} color="#fff" />
             </View>
             <Text style={styles.greeting} accessibilityRole="header">
-              SafeRoutes <Text style={styles.greetingCity}>San Jose</Text>
+              WalkWise <Text style={styles.greetingCity}>San Jose</Text>
             </Text>
           </View>
           <Text style={styles.tagline}>
@@ -3389,8 +3427,8 @@ export default function App() {
                 <Polyline
                   key={`corridor-${i}`}
                   coordinates={c.points}
-                  strokeColor={MAP_COLORS.busyRoad}
-                  strokeWidth={7}
+                  strokeColor={MAP_COLORS.highRiskZone}
+                  strokeWidth={10}
                 />
               ))}
               {ranksRoutes &&
@@ -3683,7 +3721,7 @@ export default function App() {
                   <>
                     <FactRow
                       icon="traffic"
-                      label="High-injury streets"
+                      label="High-risk zones"
                       value={busyRoadsValue(active)}
                       tone={active.corridorMeters > 0 ? 'warn' : 'good'}
                     />
@@ -3728,7 +3766,7 @@ export default function App() {
                 />
                 <FactRow
                   icon="traffic"
-                  label="High-injury streets"
+                  label="High-risk zones"
                   value={busyRoadsValue(driveResult)}
                   tone={driveResult.corridorMeters > 0 ? 'warn' : 'good'}
                 />
@@ -3763,7 +3801,7 @@ export default function App() {
               (mapCrashes.length >= MAP_CRASH_LIMIT
                 ? `Only the ${MAP_CRASH_LIMIT} most recent in view are shown, so zoom in further to see all. `
                 : '') +
-              'Crashes from the last five years and high-injury streets: City of San Jose. ' +
+              'Crashes from the last five years and high-risk zones (Vision Zero safety corridors): City of San Jose. ' +
               (travelMode === 'walk' ? 'Crosswalks: OpenStreetMap.' : '')
             }
           />
